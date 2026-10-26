@@ -216,8 +216,18 @@ one model, treat the first two as mandatory.
   duplicate had to be repaired by editing the message store by hand). Read the highest existing value
   out of the session (a read-only sqlite query is enough — no kernel boot), allocate above
   `max(counter, closed, ledger_max)`, and keep a number allocated by `detect` only while nothing else
-  has claimed it. State the rule as "sequence order equals number order": hold the lock across the
-  read **and** the append, or a later cycle can land before the entry it belongs after. Three more of
+  has claimed it.  State the rule as "sequence order equals number order": hold the lock across the
+  read **and** the append, or a later cycle can land before the entry it belongs after. **The writes
+  that record the outcome belong in that same section** — the monotonic marker, the counter, clearing a
+  consumed pin. Release the lock first and a second caller allocates the next number inside the gap,
+  then the first caller overwrites both files with its older value: the marker retreats, which is
+  exactly what the monotonic guard exists to forbid (a guard is worth nothing if it judges a value it
+  read outside the lock). Only a failed append may leave before those writes, so "append failed, round
+  not consumed" keeps holding. **A lock-free reader needs a write it cannot see half of**: `peek`
+  deliberately takes no lock, so truncate-then-write lets it read `''` or a prefix and exit non-zero,
+  which callers misread as "nothing allocated yet" (measured: 24 of 120 reads against a widened write,
+  0 with temp-file-and-rename). Write the marker, counter and pin through a temp file plus `mv`, and
+  assert no `*.tmp.*` survives. Three more of
   the same family, each worth its own assertion: **absent is not corrupt** — a missing counter means 0,
   but a counter that exists and does not parse is a truncated write, so refuse instead of renumbering
   from 1 (the renumber collides with rounds already in the record); **a failed append must not consume
@@ -291,6 +301,12 @@ one model, treat the first two as mandatory.
   writing files for minutes afterwards (it re-wrote a revert three minutes later). Check the loop's
   session `last_activity_at` in `state.db` and the mtimes of the files you are about to touch, and
   wait for idle before editing or reverting.
+- **A second agent may be operating the same loop, and memory shows it before the filesystem does.** Rows written
+  in the last minutes that describe a backup path, a scheduled restart, a paused cron job or a commit you did not
+  make are that agent's trail: the wake loop records its own actions within a minute. Before any teardown, purge or
+  "clean up the leftovers", re-read `systemctl --user show -p MainPID -p ActiveEnterTimestamp <unit>`, the cron
+  job's `enabled` flag, and the newest rows — then reconcile ids instead of repeating the work. Two agents pausing
+  the same monitor or deleting the same batch is how one of them silently reverses the other's fix.
 - **Run `hk gate-check` before the first dispatch.** The gate plugin is loaded per profile,
   so an install that only touched `default` blocks the orchestrator's own completions and
   lets every worker through. Exit code 1 names the ungated profiles; `install.sh --gate
@@ -455,6 +471,11 @@ existing one. Five rules that cost the loop silently:
   job's monitor was swapped** (delivery tests do exactly that). Fix the job, not
   the issue: the Cron section of the `hermes-agent` skill's background-systems
   reference carries the swap/restore procedure.
+- **Cadence belongs to the schedule, and whoever runs the loop owns it.** Every wake is a full turn, so
+  an interval tuned for a burst (a reporter replying every few minutes) is pure waste once the thread
+  goes quiet: after two consecutive rounds that found nothing to fix, lengthen the detection interval,
+  state the new worst-case latency out loud, and give the one-line command that reverts it. Keep the
+  number out of the job's description text — two copies drift and the next reader trusts the stale one.
 
 ## Pitfalls
 
@@ -541,7 +562,26 @@ existing one. Five rules that cost the loop silently:
 - **A wake turn carries the origin session's platform, not `cron`.** The wake is delivered into the session that
   armed the watcher, so `agent_context`/`platform` are that session's (`webui`), and any per-platform policy —
   memory retain gating, quotas, delivery adapters — that keys on `cron` never sees it. Key such policy on the
-  session id instead, and classify the turn by its prompt prefix (`[IMPORTANT: Background process proc…]`).
+  session id instead, and classify the turn by its prompt prefix (`[IMPORTANT: Background process proc…`).
+- **A wake turn is retained as if the user had spoken it.** The memory layer sees an ordinary chat turn, so a loop
+  that wakes every few minutes fills the bank with what it was doing rather than what was decided — measured on one
+  monitoring session: ~1.1k rows against an order of magnitude fewer from a real conversation, ~15 % raw process
+  state, ~74 % project intermediate state, ~11 % judgement, with machine acts stored as `Involving: user` and
+  contradictory preferences written minutes apart. So **"progress" is not a reason to wake**: wake on a decision,
+  on a terminal state, or on a TTL expiry, and let the ledger hold everything in between. When the loop must wake
+  for progress anyway, gate the retain on the turn's own marker (the wake prompt starts with
+  `[IMPORTANT: Background process `, which one config line in the memory plugin can match for every session at
+  once) rather than maintaining a blocklist of session ids. Diagnose and gate with the recipe in the
+  `hindsight-memory-ops` skill (its retention-audit reference: query the bank by `document_id`, classify the
+  rows, then gate on the turn marker); the cost model to quote is "one wake = one full context window, and
+  one remember-write".
+- **A design defect goes to the owner as a report file, not a chat summary.** When the fault is in the loop's *logic*
+  (what deserves a wake) rather than in a crashed path, the thing the user can hand to whoever fixes it is a standalone
+  document, and it has a fixed shape: measured current-state numbers **with the window and the exact query** that
+  produced them; a `file:line` anchor for each layer of the cause; the local mitigation stated with its config keys and,
+  separately, what it does **not** fix; ranked fixes each with an acceptance criterion that can be re-run; and an appendix
+  naming the data sources so the owner can falsify the numbers. A chat paraphrase loses the counts and cannot be turned
+  into an acceptance test. Write it under the workspace docs, keep the chat reply to the path plus three findings.
 - **A test can pass because the code it drives never ran**, a redirected install can rewrite the
   host's units, and a load harness can "prove" a race fixed without ever entering the window. All
   three live in `references/testing-and-release.md` (child-process liveness assertion, revert-callers
@@ -561,6 +601,12 @@ existing one. Five rules that cost the loop silently:
   `(withdrawn)` marker in the note) instead of inferring it from the object being non-empty. Where the file's
   *presence* also serves as an evidence rule somewhere else (the sweep and `hk gc` keep any run carrying an
   incident), write down in the code which reading is deliberate — otherwise the next reader "fixes" the other half.
+  **Two files describing one fact must answer damage identically.** The counter and the last-written-round
+  marker are read by several verbs; parsing the marker with the rule that belongs to a *missing* file
+  (silently 0) while refusing a corrupt counter made the pair disagree, and the zero rewound the next
+  allocation into rounds the record already held. One reader per file, called directly (never `x=$(reader)`,
+  which turns a refusal into an empty string), absent or empty means never written, present-but-unparsable
+  refuses.
 - **Reproduce the reporter's order in the fixture, not just its end state.** A withdrawn incident only exists after
   `doctor --fix` has run, so hand-writing the file and asserting on `status` tests the *open* case and looks like the
   fix failing. Drive the same writer the reporter did, and choose the run shape on purpose: a running run reaches
@@ -612,3 +658,40 @@ A numbered, language-consistent ledger entry is written with `$HERMES_HOME/scrip
 (shipped from `config/scripts/ledger-round.sh`): `detect` allocates the round and keeps the payload on
  disk, `record` writes the one human-readable entry for it, `peek`/`next`/`reuse N` are the raw verbs.
  Every call prints its state path and round number to stderr.
+
+## Wake policy: a detection is not a decision
+
+The loop has two halves and they answer different questions. The scheduled tick (a `no_agent` cron
+job) answers *what changed* -- cheap, silent, no model. The armed observer answers *may I reach a
+person* -- and only its exit can wake a conversation, so everything that touches it is expensive:
+a wake runs a whole agent turn in that session (context, money) and, because the wake arrives as an
+ordinary message, whatever memory the session's plugin extracts from it.
+
+Treating those two questions as one is the loop's worst known failure. A field case: every tick that
+detected activity touched `signal.md`, so a monitoring loop woke its own conversation 71 times in a
+day -- 218 turns, 6.5e8 input tokens, 1072 long-term memories of which 89% were process status
+("issue-wake-16 job is running"), including machine actions stored with `Involving: user` because
+nothing distinguished a notification from a person speaking.
+
+Rules:
+
+- **Record first, decide second.** A held wake must still leave its round in the ledger. Coalescing
+  is not loss; if the round only exists in the wake, the wake becomes the delivery mechanism.
+- **Judge in a tested script, never in the tick body.** `config/scripts/wake-policy.py` holds the
+  whole policy and the suite drives it; a shell `if` inside the cron script cannot be asserted on,
+  and this defect was exactly an unconditional `>> signal.md`.
+- **A new issue wakes immediately; everything else coalesces.** Someone opening an issue is waiting
+  on a person. Progress notes, our own replies, and repeat detections are not: they wait for the
+  cooldown (`IW_WAKE_MIN_INTERVAL`, default 3600s) and are absorbed into the next wake, which says
+  how many rounds it speaks for.
+- **A corrupt policy state refuses; it does not reset.** Resetting the cooldown on unreadable state
+  turns a crash into a burst of wakes -- the failure the policy exists to prevent.
+- **Say who spoke.** A round can mix our reply with theirs; naming the first commenter printed
+  "by <us>" for exactly the rounds that mattered and made the wake look like an echo. The reason
+  names the other party and counts our own as `+N own`.
+- **Report whether the channel is armed, in `hk status`.** The observer is a child of whatever armed
+  it, so a WebUI restart silently kills the loop while the timer still looks healthy. `hk status`
+  prints `wake channel: armed -- <run> watching <path>` or `not armed`, and `hawkeye-doctor.timer`
+  is the backstop that re-arms it.
+- **Do not arm a loop whose only output is "still working".** If a round would produce a progress
+  note, it does not deserve a turn. Batch it, or leave it in the ledger for the next real wake.

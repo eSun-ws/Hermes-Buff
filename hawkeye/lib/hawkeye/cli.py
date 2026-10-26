@@ -111,16 +111,55 @@ def _legacy_runs() -> list[Path]:
     return sorted(p for p in root.iterdir() if p.is_dir() and (p / store.META).is_file())
 
 
+def _wake_channel(rows: list[dict]) -> str:
+    """Say whether anything is actually watching for a signal, in one line.
+
+    A monitoring loop has two halves: the scheduled tick that detects and records, and the armed
+    observer whose exit wakes a conversation. Only the second half can reach a person, and it dies
+    with the process that armed it (a WebUI restart takes it down), so "the timer is enabled" says
+    nothing about whether anyone will be woken. Reported from the field: the loop was down while the
+    schedule looked healthy, and the only way to notice was `ps`.
+    """
+    armed = []
+    for row in rows:
+        if row.get("status") != "running":
+            continue
+        argv = row.get("argv") or []
+        if "watch-file" not in argv:
+            continue
+        try:
+            path = argv[argv.index("--path") + 1]
+        except (ValueError, IndexError):
+            path = "(unknown path)"
+        armed.append("%s watching %s" % (row["run"], path))
+    if armed:
+        # Every armed observer, not just the first: several loops can be armed at once, and naming
+        # one of them would make the others invisible again.
+        return "armed -- " + "; ".join(sorted(armed))
+    return ("not armed -- no observer is running, so a scheduled tick can record but cannot wake a "
+            "conversation; re-arm with `hk run --id <id> -- <command>`")
+
+
+
 def cmd_status(args: argparse.Namespace, cfg: dict) -> int:
     targets = _targets(args)
     rows = []
     for rid in targets:
         rows.append(_describe(rid))
+    # `hk status` with no --run shows nothing, but the wake question is about the whole host: an
+    # observer armed an hour ago in another window is exactly what makes a dead loop hard to see.
+    wake_rows = rows
+    if not getattr(args, "all", False):
+        root = store.run_root()
+        if root.is_dir():
+            wake_rows = [_describe(p.name) for p in sorted(root.iterdir())
+                         if (p / store.META).is_file()]
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
     if not rows:
         print("(no runs)")
+        print("wake channel: " + _wake_channel(wake_rows))
         for legacy in _legacy_runs():
             print("note: %s lives in the legacy run root %s; it is not supervised from here"
                   % (legacy.name, store.hermes_home() / "hawkeye-v2" / "runs"))
@@ -133,6 +172,7 @@ def cmd_status(args: argparse.Namespace, cfg: dict) -> int:
             "-" if row["sup_age_s"] is None else "%ds" % row["sup_age_s"],
             "-" if row["lease_age_s"] is None else "%ds" % row["lease_age_s"],
             row["note"]))
+    print("wake channel: " + _wake_channel(wake_rows))
     for legacy in _legacy_runs():
         print("note: %s lives in the legacy run root %s; it is not supervised from here"
               % (legacy.name, store.hermes_home() / "hawkeye-v2" / "runs"))
@@ -178,6 +218,9 @@ def _describe(rid: str) -> dict:
         "incident": incident or None,          # raw document, audit trail included
         "incident_open": incident_open,
         "note": ", ".join(notes),
+        # The argv is here so `status` can answer "is anything actually watching?" instead of
+        # leaving that to `ps`.
+        "argv": list(meta.get("argv") or []),
     }
 
 

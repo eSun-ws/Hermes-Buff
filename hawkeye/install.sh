@@ -308,7 +308,7 @@ elif [ -d "$REPO_DIR/skill/hermes-hawkeye-v2" ]; then
     # too: a fresh host otherwise had a rule pointing at a script that existed only in the repository
     # (issue #17, and the report that followed it).
     mkdir -p "$HERMES_HOME/scripts"
-    for tool in ledger-round.sh; do
+    for tool in ledger-round.sh issue-tick.sh wake-policy.py issue-watch.py; do
         install -m 755 "$REPO_DIR/config/scripts/$tool" "$HERMES_HOME/scripts/$tool"
     done
     for tool in $(grep -o 'config/scripts/[A-Za-z0-9._-]*\.sh' "$REPO_DIR/skill/hermes-hawkeye-v2/SKILL.md" | sort -u); do

@@ -264,6 +264,158 @@ def test_skill_ships_every_file_it_points_at() -> None:
           "skill install incomplete" in installer, "no runtime assertion in install.sh")
 
 
+def test_status_says_whether_the_wake_channel_is_armed() -> None:
+    """The loop has two halves and only one of them can reach a person.
+
+    Reported from the field: the timer was enabled and looked healthy while the observer was dead
+    (killed with the WebUI that armed it), so nothing was ever woken. `hk status` answers the
+    question directly instead of leaving it to `ps`, and the answer must follow the facts rather than
+    being a constant string.
+    """
+    cli = Path(__file__).resolve().parents[1] / "bin" / "hk"
+    # A private run root: the shared one carries whatever the earlier tests left, and the point here
+    # is the answer, not the neighbours.
+    root = BASE / "wake-status-root"
+    root.mkdir(exist_ok=True)
+    env = {**ENV, "HAWKEYE_V2_ROOT": str(root)}
+    empty = subprocess.run([sys.executable, str(cli), "status"], capture_output=True, text=True,
+                           env=env, timeout=120)
+    check("status: with nothing armed it says so",
+          "wake channel: not armed" in empty.stdout, (empty.stdout or "")[-160:])
+
+    rid = "probe-armed-status"
+    rd = root / rid
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "meta.json").write_text(json.dumps({
+        "kind": "exec",
+        "argv": ["./bin/hk", "watch-file", "--path", "/tmp/signal.md", "--interval", "10"],
+        "cwd": str(rd)}))
+    (rd / "sup.heartbeat").write_text("beat")
+    armed = subprocess.run([sys.executable, str(cli), "status"], capture_output=True, text=True,
+                           env=env, timeout=120)
+    check("status: an armed observer is named, with the path it watches",
+          "wake channel: armed" in armed.stdout and rid in armed.stdout
+          and "/tmp/signal.md" in armed.stdout, (armed.stdout or "")[-200:])
+    shutil.rmtree(rd, ignore_errors=True)
+
+
+def test_wake_policy_coalesces_and_never_drops_a_round() -> None:
+    """A detection is not a decision: the policy, not the detector, decides who gets woken.
+
+    Reported as the wake loop's real defect (a day of monitoring produced 218 turns, 6.5e8 input
+    tokens and 1072 memories of which 89% were process status): every rc=10 touched the signal file,
+    so every progress note woke a human conversation. The detector still answers "what changed"; this
+    file answers "does a person need to look now", and the assertions below are the contract --
+
+    * a new issue wakes immediately (someone is waiting),
+    * a reply inside the cooldown is held, counted, and never lost (pending rises),
+    * the first tick after the cooldown wakes once and absorbs the held rounds,
+    * a corrupt policy state refuses instead of resetting the cooldown (a reset would burst),
+    * --dry-run answers without writing, so a probe cannot change when the next wake happens.
+    """
+    policy = Path(__file__).resolve().parents[1] / "config" / "scripts" / "wake-policy.py"
+    check("wake-policy: the policy ships in the tree", policy.is_file(), str(policy))
+    if not policy.is_file():
+        return
+    work = BASE / "wake-policy"
+    work.mkdir()
+    state = work / "wake.json"
+    fresh = work / "fresh.json"
+    fresh.write_text(json.dumps([{"number": 30, "title": "new", "first_seen": True,
+                                  "new_comments": []}]))
+    reply = work / "reply.json"
+    reply.write_text(json.dumps([{
+        "number": 19, "title": "old", "first_seen": False,
+        "new_comments": [{"user": {"login": "BumBee-dev"}, "body": "still open?"}]}]))
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(policy), "--state", str(state), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    first = run("--items", str(fresh), "--now", "2026-10-26T23:00:00Z")
+    check("wake-policy: a new issue wakes at once",
+          first.stdout.startswith("wake") and "new issue" in first.stdout,
+          (first.stdout or "")[:120])
+    held = run("--items", str(reply), "--now", "2026-10-26T23:05:00Z")
+    check("wake-policy: a reply inside the cooldown is held, not woken",
+          held.stdout.startswith("hold"), (held.stdout or "")[:120])
+    recorded = json.loads(state.read_text())
+    check("wake-policy: a held round is counted, so coalescing is not loss",
+          recorded.get("pending") == 1 and recorded.get("held") == 1, json.dumps(recorded))
+    later = run("--items", str(reply), "--now", "2026-10-27T00:05:00Z")
+    check("wake-policy: the first tick past the cooldown wakes once",
+          later.stdout.startswith("wake"), (later.stdout or "")[:120])
+    drained = json.loads(state.read_text())
+    check("wake-policy: the wake drains the pending count",
+          drained.get("pending") == 0 and drained.get("wakes") == 2, json.dumps(drained))
+
+    before = state.read_text()
+    dry = subprocess.run([sys.executable, str(policy), "--state", str(state),
+                          "--items", str(reply), "--now", "2026-10-26T23:10:00Z", "--dry-run"],
+                         capture_output=True, text=True, timeout=60)
+    check("wake-policy: --dry-run answers without moving the next wake",
+          dry.stdout.startswith("hold") and state.read_text() == before,
+          dry.stdout.strip()[:120])
+
+    broken = work / "broken.json"
+    broken.write_text("{bad")
+    refusal = subprocess.run([sys.executable, str(policy), "--state", str(broken),
+                              "--items", str(reply), "--now", "2026-10-27T02:00:00Z"],
+                             capture_output=True, text=True, timeout=60)
+    check("wake-policy: a corrupt policy state refuses instead of resetting the cooldown",
+          refusal.returncode == 1 and "refusing to guess" in (refusal.stderr or "")
+          and broken.read_text() == "{bad", "rc=%s" % refusal.returncode)
+
+
+def test_issue_tick_records_every_round_and_signals_only_on_a_verdict() -> None:
+    """The tick must record first and decide second; a held wake still lands in the ledger.
+
+    Uses a stand-in detector and a stand-in allocator: what is asserted is this script's ordering and
+    its refusal to signal on a hold, not the network or the ledger format.
+    """
+    tick = Path(__file__).resolve().parents[1] / "config" / "scripts" / "issue-tick.sh"
+    check("issue-tick: the tick ships in the tree", tick.is_file(), str(tick))
+    if not tick.is_file():
+        return
+    work = BASE / "issue-tick"
+    (work / "cache" / "hawkeye" / "issue-ledger").mkdir(parents=True)
+    home = work
+    repo = work / "repo"
+    (repo / "config" / "scripts").mkdir(parents=True)
+    detector = repo / "config" / "scripts" / "issue-watch.py"
+    detector.write_text("import json, sys\n"
+                        "print(json.dumps([{'number': 41, 'title': 'probe', 'first_seen': False, 'new_comments': "
+                        "[{'user': {'login': 'someone'}, 'body': 'hi'}]}]))\n"
+                        "sys.exit(10)\n")
+    recorder = work / "ledger-round.sh"
+    recorder.write_text('#!/bin/bash\nprintf "detect %s\\n" "$2" >> "$IW_STATE_DIR/recorded.log"\n')
+    recorder.chmod(0o755)
+    policy = Path(__file__).resolve().parents[1] / "config" / "scripts" / "wake-policy.py"
+    env = {**ENV, "HERMES_HOME": str(home), "GITHUB_TOKEN": "x", "IW_LEDGER": "led",
+           "IW_REPO_DIR": str(repo), "IW_LEDGER_ROUND": str(recorder), "IW_POLICY": str(policy),
+           "IW_WAKE_MIN_INTERVAL": "3600", "IW_WORK": str(home / "cache" / "hawkeye" / "issue-ledger"),
+           "IW_SIGNAL": str(home / "cache" / "hawkeye" / "issue-ledger" / "signal.md")}
+    signal = Path(env["IW_SIGNAL"])
+
+    def once() -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(tick)], capture_output=True, text=True, env=env, timeout=120)
+
+    first = once()
+    check("issue-tick: the first tick signals (no cooldown on record)",
+          first.returncode == 0 and signal.is_file() and signal.stat().st_size > 0,
+          "rc=%s err=%s" % (first.returncode, (first.stderr or "")[-160:]))
+    size_after_first = signal.stat().st_size
+    second = once()
+    check("issue-tick: the next tick inside the cooldown records but does not signal",
+          second.returncode == 0 and signal.stat().st_size == size_after_first
+          and "held the wake" in (second.stderr or ""),
+          "size=%s err=%s" % (signal.stat().st_size, (second.stderr or "")[-160:]))
+    rounds = (home / "cache" / "hawkeye" / "issue-ledger" / "recorded.log")
+    check("issue-tick: both rounds were recorded even though only one woke anyone",
+          rounds.is_file() and len(rounds.read_text().strip().splitlines()) == 2,
+          rounds.read_text() if rounds.is_file() else "missing")
+
+
 def test_watch_file_exits_when_the_producer_writes() -> None:
     """The notification half must be dumb: no network, no work, exit only on a real write.
 
@@ -2599,6 +2751,9 @@ def main() -> int:
                  test_interpreter_probe_ignores_a_hostile_pythonpath,
                  test_hk_survives_a_lying_pythonpath_across_the_reexec,
                  test_gate_check_says_when_it_cannot_ask_the_cli,
+                 test_status_says_whether_the_wake_channel_is_armed,
+                 test_wake_policy_coalesces_and_never_drops_a_round,
+                 test_issue_tick_records_every_round_and_signals_only_on_a_verdict,
                  test_ledger_round_allocator_is_shipped_and_serialised,
                  test_ledger_concurrent_records_hold_the_invariants_an_outside_reader_can_see,
                  test_ledger_lock_free_peek_never_reads_a_half_written_state,
