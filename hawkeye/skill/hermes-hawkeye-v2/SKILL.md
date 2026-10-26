@@ -297,10 +297,24 @@ one model, treat the first two as mandatory.
   checkout; two writers plus a `git checkout` means the other side re-writes your revert and you
   re-write its fix. Pause the schedule first, then look at `git status`/`git log` and decide whose
   implementation wins — verifying the winner beats racing it. Resume only after the tree is clean.
-  **Pausing the schedule does not stop an in-flight run**: a turn that started before the pause keeps
+  resume only after the tree is clean. **Pausing the schedule does not stop an in-flight run**: a turn that started before the pause keeps
   writing files for minutes afterwards (it re-wrote a revert three minutes later). Check the loop's
   session `last_activity_at` in `state.db` and the mtimes of the files you are about to touch, and
   wait for idle before editing or reverting.
+- **A tree that is red before you touched it belongs to someone else — classify it in a scratch worktree before
+  editing anything.** The competing writer is often not the schedule but a *peer session* mid-feature: its
+  half-applied changes read as your regression, and its implementation and its tests can disagree with each other
+  (a rewritten command still asserted with the old wording). `git worktree add /tmp/<name> HEAD`, then run the
+  failing test there: green at HEAD means the tree carries uncommitted work that is not yours. Restore the file
+  (`git checkout HEAD -- <file>`), replay only your own hunks, and commit with explicit pathspecs
+  (`git add <your files>`) so the other writer's edits stay uncommitted for its owner to finish — copy its version
+  outside the repository first if you overwrite the file. Never reconcile the pair by picking one side; say in the
+  commit message which paths you deliberately left out and why.
+- **A test that is not listed in the suite's registry never runs.** `tests/selftest.py` dispatches from an explicit
+  tuple in `main()`, so a test function added above it is defined and silently skipped: the total does not move and
+  `result: all passed` prints over code that never executed. After adding tests, require the count to rise by the
+  number added — a run that reports the previous total is the tell — and quote the new total in the commit message
+  so the next session can compare against it.
 - **A second agent may be operating the same loop, and memory shows it before the filesystem does.** Rows written
   in the last minutes that describe a backup path, a scheduled restart, a paused cron job or a commit you did not
   make are that agent's trail: the wake loop records its own actions within a minute. Before any teardown, purge or
