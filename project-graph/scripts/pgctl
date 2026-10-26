@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# pgctl — Project Graph headless controller.
+#
+# Banner: Project Graph is a Tauri/WebKitGTK desktop app. It needs an X display,
+# never a monitor, a desktop session or a window manager. This script owns a bare
+# Xvfb display plus the app process, and talks to the app through its built-in
+# tool CLI (`project-graph tool invoke`), which routes every call to the running
+# window through the ownership helper.
+#
+# Lifetime rule (HERMES.md §6): a background instance must have a deadline and a
+# way back. `start` prints the deadline, arms an idle watchdog, `stop` verifies.
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
+APP="$ROOT/app/project-graph"
+CLI="$ROOT/cli/project-graph.mjs"
+TEMPLATES="$ROOT/templates"
+
+HERMES_HOME=${HERMES_HOME:-$HOME/.hermes}
+WORKSPACE=${PG_WORKSPACE:-$HERMES_HOME/../Workspace}
+DISPLAY_NUM=${PG_DISPLAY:-:99}
+GEOMETRY=${PG_GEOMETRY:-1600x900}
+TTL_MIN=${PG_TTL_MIN:-60}
+STATE=${PG_STATE:-${XDG_RUNTIME_DIR:-/tmp}/project-graph}
+APPDATA=${XDG_DATA_HOME:-$HOME/.local/share}/liren.project-graph
+
+# Reuse the node that Hermes already ships; do not install a second copy.
+NODE=${PG_NODE:-}
+if [[ -z $NODE ]]; then
+  for c in "$HERMES_HOME"/tools/node-*-linux-x64/bin/node; do
+    [[ -x $c ]] && NODE=$c && break
+  done
+fi
+[[ -x ${NODE:-} ]] || NODE=$(command -v node || true)
+[[ -x ${NODE:-} ]] || { echo "pgctl: node not found (need >=26); set PG_NODE" >&2; exit 1; }
+
+mkdir -p "$STATE"
+APP_PID_FILE="$STATE/app.pid"
+XVFB_PID_FILE="$STATE/xvfb.pid"
+OPEN_FILE="$STATE/open-project"
+ACTIVITY="$STATE/last-activity"
+LOG="$STATE/app.log"
+WATCHDOG_PID_FILE="$STATE/watchdog.pid"
+
+log() { printf 'pgctl: %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+touch "$ACTIVITY"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+app_pid() {
+  [[ -f $APP_PID_FILE ]] || return 1
+  local p; p=$(cat "$APP_PID_FILE")
+  [[ -n $p ]] && kill -0 "$p" 2>/dev/null || return 1
+  # A recycled PID would make us talk to a stranger; check the command line.
+  tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -qF "$APP" && printf '%s' "$p"
+}
+xvfb_pid() {
+  [[ -f $XVFB_PID_FILE ]] || return 1
+  local p; p=$(cat "$XVFB_PID_FILE")
+  [[ -n $p ]] && kill -0 "$p" 2>/dev/null && printf '%s' "$p"
+}
+
+# Keys only reach the app when its window holds focus; on a bare Xvfb there is no
+# focused window at all, so every keyboard action must be preceded by this.
+focus_window() {
+  local disp=${1:-${DISPLAY:-$DISPLAY_NUM}} w
+  w=$(DISPLAY=$disp xdotool search --name "Project Graph" 2>/dev/null | tail -1)
+  [[ -n $w ]] || die "no Project Graph window on $disp"
+  # windowactivate reports success even with no WM (it only emits a warning about
+  # _NET_ACTIVE_WINDOW), and then the focus never moves. Always follow it with an
+  # explicit windowfocus — without that step every later key press lands nowhere.
+  DISPLAY=$disp xdotool windowactivate --sync "$w" >/dev/null 2>&1 || true
+  DISPLAY=$disp xdotool windowfocus --sync "$w" >/dev/null 2>&1 || true
+  sleep 0.5
+}
+
+# The save dialog is a separate top-level window whose title is localized
+# (its title is localized: "Save File", or a translated equivalent). Without a WM it never takes
+# focus by itself, so
+# typing lands in the app window unless we focus it explicitly. Find it by
+# "any visible window that is not the app", newest last.
+dialog_window() {
+  local disp=${1:-${DISPLAY:-$DISPLAY_NUM}} w n
+  DISPLAY=$disp xdotool search --onlyvisible --name "" 2>/dev/null | while read -r w; do
+    n=$(DISPLAY=$disp xdotool getwindowname "$w" 2>/dev/null) || continue
+    [[ -z $n || $n == "Project Graph" ]] && continue
+    printf '%s|%s\n' "$w" "$n"
+  done | tail -1 | cut -d'|' -f1
+}
+
+dialog_open() { [[ -n $(dialog_window "${1:-}") ]]; }
+
+# A dialog left open by an interrupted export steals focus from the next one, and
+# its title looks just like a live dialog. Clear before starting a new export.
+clear_dialogs() {
+  local disp=${1:-${DISPLAY:-$DISPLAY_NUM}} i
+  for i in 1 2 3; do
+    [[ -z $(dialog_window "$disp") ]] && return 0
+    DISPLAY=$disp xdotool key --clearmodifiers Escape
+    sleep 0.7
+  done
+  [[ -z $(dialog_window "$disp") ]] || die "a dialog is stuck open — run: pgctl repair"
+}
+
+wait_dialog() { # $1 = display, $2 = seconds
+  local disp=$1 deadline=$(( $(date +%s) + ${2:-15} )) w
+  while (( $(date +%s) < deadline )); do
+    w=$(dialog_window "$disp")
+    [[ -n $w ]] && { printf '%s' "$w"; return 0; }
+    sleep 0.5
+  done
+  return 1
+}
+
+ensure_xvfb() {
+  if xvfb_pid >/dev/null; then return 0; fi
+  if [[ -n ${DISPLAY:-} ]] && xdpyinfo >/dev/null 2>&1; then
+    log "using existing DISPLAY=$DISPLAY (no Xvfb started)"
+    return 0
+  fi
+  have Xvfb || die "Xvfb missing: apt-get install -y xvfb"
+  setsid Xvfb "$DISPLAY_NUM" -screen 0 "${GEOMETRY}x24" -nolisten tcp \
+    >"$STATE/xvfb.log" 2>&1 </dev/null &
+  echo $! >"$XVFB_PID_FILE"
+  for _ in $(seq 1 40); do
+    DISPLAY=$DISPLAY_NUM xdpyinfo >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  DISPLAY=$DISPLAY_NUM xdpyinfo >/dev/null 2>&1 || die "Xvfb $DISPLAY_NUM did not come up"
+  log "Xvfb $DISPLAY_NUM up (${GEOMETRY}x24, no WM — expected)"
+}
+
+# Export actions ship with no default shortcut; give them deterministic keys so a
+# headless caller never has to find a menu item. The app reads this file at start.
+ensure_keybinds() {
+  mkdir -p "$APPDATA"
+  "$NODE" - "$APPDATA/keybinds2.json" <<'JS'
+const fs = require("node:fs");
+const p = process.argv[2];
+let d = {};
+try { d = JSON.parse(fs.readFileSync(p, "utf8")); } catch { d = {}; }
+const want = { exportSvgAll: "C-S-e", exportPngLegacy: "C-S-p" };
+let changed = false;
+for (const [id, key] of Object.entries(want)) {
+  if (!d[id] || d[id].key !== key || d[id].isEnabled !== false) {
+    if (!d[id] || d[id].key !== key) { d[id] = { ...(d[id] || {}), isEnabled: true, key }; changed = true; }
+  }
+}
+fs.writeFileSync(p, JSON.stringify(d, null, 2));
+process.stdout.write(changed ? "changed" : "unchanged");
+JS
+}
+
+start_app() { # $1 = project path (optional)
+  ensure_keybinds >/dev/null
+  local proj=${1:-}
+  ensure_xvfb
+  if app_pid >/dev/null; then
+    local want="" have_proj=""
+    [[ -n $proj ]] && want=$(readlink -f "$proj")
+    have_proj=$(cat "$OPEN_FILE" 2>/dev/null || true)
+    if [[ -z $want || $want == "$have_proj" ]]; then
+      log "app already running (pid $(app_pid)) with ${have_proj:-no project}"
+      return 0
+    fi
+    # A different project needs a different window state: the app has no
+    # single-instance hand-off, so open-in-place is not reliable. Restart instead.
+    log "app is running with ${have_proj:-no project}; restarting for $want"
+    cmd_stop
+    ensure_xvfb
+  fi
+  export DISPLAY=${DISPLAY:-$DISPLAY_NUM}
+  local args=()
+  [[ -n $proj ]] && args=("$(readlink -f "$proj")")
+  setsid "$APP" "${args[@]}" >"$LOG" 2>&1 </dev/null &
+  echo $! >"$APP_PID_FILE"
+  [[ -n $proj ]] && readlink -f "$proj" >"$OPEN_FILE"
+  for _ in $(seq 1 120); do
+    if have xdotool && DISPLAY=$DISPLAY xdotool search --name "Project Graph" >/dev/null 2>&1; then
+      # The window exists before the webview is done wiring its keyboard handlers:
+      # the first synthetic key after start is otherwise dropped. Give it a moment.
+      sleep 3
+      return 0
+    fi
+    sleep 0.5
+  done
+  # No xdotool: fall back to "the process stayed alive for 10s".
+  sleep 10
+  app_pid >/dev/null || die "app exited early — see $LOG"
+}
+
+arm_watchdog() {
+  if [[ -f $WATCHDOG_PID_FILE ]] && kill -0 "$(cat "$WATCHDOG_PID_FILE")" 2>/dev/null; then return 0; fi
+  setsid bash -c '
+    self_pid=$$; echo $self_pid > "$1/watchdog.pid"
+    ttl=$2
+    while kill -0 "$3" 2>/dev/null || kill -0 "$4" 2>/dev/null; do
+      sleep 60
+      idle=$(( $(date +%s) - $(stat -c %Y "$1/last-activity" 2>/dev/null || echo 0) ))
+      if (( idle > ttl * 60 )); then
+        echo "watchdog: idle ${idle}s > ${ttl}min, stopping" >> "$1/watchdog.log"
+        "$5" stop >> "$1/watchdog.log" 2>&1
+        exit 0
+      fi
+    done
+  ' _ "$STATE" "$TTL_MIN" "$(cat "$APP_PID_FILE" 2>/dev/null || echo 0)" \
+    "$(cat "$XVFB_PID_FILE" 2>/dev/null || echo 0)" "$SELF" >/dev/null 2>&1 </dev/null &
+}
+
+usage() {
+  cat <<EOF
+pgctl — Project Graph headless control (bare Xvfb + built-in tool CLI)
+
+  start [project.prg]        start Xvfb + app (optionally opening a project)
+  stop                       stop app + the Xvfb this script started (verified)
+  status                     what is running, which project, TTL left, bridge health
+  repair                     restart the app (fixes a wedged tool bridge)
+  forget <project.prg>       drop stored refs/ownership for a path (fixes stale_ref)
+  tool list                  every built-in tool with its JSON schema
+  tool <name> [args...]      run a built-in tool, e.g.
+                               pgctl tool get_all_nodes --project x.prg --input '{}'
+  describe <name>            the tool's JSON schema
+  save <project.prg>         Ctrl+S in the window (persist forwarded edits)
+  export <project.prg> <out.svg|out.png>
+                             render the project to an image file
+  new <path.prg>             copy the starter template (1 node, current format)
+  doctor                     check every dependency
+
+Env: PG_DISPLAY=:99  PG_TTL_MIN=60  PG_NODE=<node>  PG_WORKSPACE=<dir>  PG_GEOMETRY=1600x900
+EOF
+}
+
+cmd_start() {
+  start_app "${1:-}"
+  arm_watchdog
+  local disp=${DISPLAY:-$DISPLAY_NUM}
+  local target; target=$(cat "$OPEN_FILE" 2>/dev/null || echo "(none)")
+  printf 'pgctl: running on Xvfb %s, project %s\n' "$disp" "$target"
+  printf 'pgctl: idle watchdog armed — stops itself after %s min without a pgctl call\n' "$TTL_MIN"
+  printf 'pgctl: stop early with: %s stop\n' "$SELF"
+}
+
+cmd_stop() {
+  local stopped=0 p
+  if p=$(app_pid); then
+    kill "$p" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$p" 2>/dev/null || true
+    stopped=1
+  fi
+  # Only tear down the Xvfb we created ourselves.
+  if p=$(xvfb_pid); then
+    kill "$p" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$p" 2>/dev/null || true
+    stopped=1
+  fi
+  [[ -f $WATCHDOG_PID_FILE ]] && kill "$(cat "$WATCHDOG_PID_FILE")" 2>/dev/null || true
+  rm -f "$APP_PID_FILE" "$XVFB_PID_FILE" "$WATCHDOG_PID_FILE" "$OPEN_FILE"
+  # A second instance may have been started from a different PG_STATE, so the pid
+  # file is not authoritative. Kill every app of *this install* and then verify:
+  # a dead wrapper with a live app is a failure, not a success.
+  sleep 1
+  local left
+  left=$(pgrep -f "$ROOT/app/project-graph" 2>/dev/null || true)
+  if [[ -n $left ]]; then
+    log "killing untracked instance(s): $(tr '\n' ' ' <<<"$left")"
+    kill $left 2>/dev/null || true
+    sleep 1
+    left=$(pgrep -f "$ROOT/app/project-graph" 2>/dev/null || true)
+    [[ -n $left ]] && kill -9 $left 2>/dev/null || true
+    sleep 1
+  fi
+  left=$(pgrep -f "$ROOT/app/project-graph" 2>/dev/null || true)
+  if [[ -n $left ]]; then
+    die "stop incomplete: project-graph still running (pid $(tr '\n' ' ' <<<"$left"))"
+  fi
+  (( stopped )) && log "stopped and verified" || log "nothing was running"
+}
+
+kill_stragglers() {
+  local p
+  for p in $(pgrep -f "$CLI tool invoke" 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+  for p in $(pgrep -f "$ROOT/cli/project-graph-ownership-helper" 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+}
+
+# The runtime bridge serves one forwarded call at a time; if it ever wedges (hung
+# CLI, killed mid-flight, stale ownership record) the only cure is a fresh process.
+cmd_repair() {
+  local proj; proj=$(cat "$OPEN_FILE" 2>/dev/null || true)
+  cmd_stop
+  kill_stragglers
+  [[ -n $proj ]] && { cmd_start "$proj"; } || log "repaired (no project was open)"
+}
+
+cmd_status() {
+  local p
+  if p=$(app_pid); then echo "app:    running (pid $p) on ${DISPLAY:-$DISPLAY_NUM}"; else echo "app:    not running"; fi
+  if p=$(xvfb_pid); then echo "xvfb:   running (pid $p) ${DISPLAY_NUM} ${GEOMETRY}"; else echo "xvfb:   not running (or reusing an external DISPLAY)"; fi
+  echo "project: $(cat "$OPEN_FILE" 2>/dev/null || echo '(none)')"
+  local idle=$(( $(date +%s) - $(stat -c %Y "$ACTIVITY" 2>/dev/null || echo 0) ))
+  echo "idle:    ${idle}s  (ttl ${TTL_MIN}min)"
+  echo "tools:   $("$NODE" "$CLI" tool list 2>/dev/null | grep -o '"name"' | wc -l) available"
+  local proj; proj=$(cat "$OPEN_FILE" 2>/dev/null || true)
+  if [[ -n $proj ]]; then
+    if timeout 8 "$NODE" "$CLI" tool invoke get_all_nodes --project "$proj" --input '{}' >/dev/null 2>&1; then
+      echo "bridge:  responsive"
+    else
+      echo "bridge:  NOT responding — run: $SELF repair"
+    fi
+  fi
+}
+
+# The app's reference store must know a project before it accepts a write; the
+# first write on an unknown file fails with a misleading PROJECT_LOAD_FAILED.
+prime() { "$NODE" "$CLI" tool invoke get_all_nodes --project "$1" --input '{}' >/dev/null 2>&1 || true; }
+
+cmd_tool() {
+  local name=${1:?tool name required}; shift
+  [[ $name == list ]] && { "$NODE" "$CLI" tool list; return 0; }
+  local proj=""
+  for ((i=1; i<=$#; i++)); do
+    [[ ${!i} == "--project" ]] && { j=$((i+1)); proj=${!j}; }
+  done
+  [[ -n $proj ]] && prime "$proj"
+  touch "$ACTIVITY"
+  local to=${PG_TOOL_TIMEOUT:-120}
+  timeout --signal=TERM --kill-after=5 "$to" "$NODE" "$CLI" tool invoke "$name" "$@"
+  local rc=$?
+  if (( rc == 124 || rc == 137 )); then
+    # A call left hanging holds the project's ownership lock, and every later call
+    # then queues behind it. Clear the corpse; if the bridge itself is wedged the
+    # caller should run: pgctl repair
+    kill_stragglers
+    log "tool '$name' timed out after ${to}s (stragglers cleared) — retry, or: pgctl repair"
+  fi
+  return $rc
+}
+
+cmd_describe() { "$NODE" "$CLI" tool describe "${1:?tool name required}"; }
+
+cmd_save() {
+  local proj=${1:?project path required}
+  local open; open=$(cat "$OPEN_FILE" 2>/dev/null || true)
+  [[ $open == "$(readlink -f "$proj")" ]] || die "that project is not the one open in the window ($open) — start it: pgctl start $proj"
+  have xdotool || die "xdotool missing: apt-get install -y xdotool"
+  local before after
+  focus_window
+  before=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
+  xdotool key --clearmodifiers ctrl+s
+  for _ in $(seq 1 20); do
+    after=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
+    (( after > before )) && { touch "$ACTIVITY"; log "saved ($(stat -c %s "$proj") bytes)"; return 0; }
+    sleep 0.5
+  done
+  # No pending edits → Ctrl+S is a no-op and the mtime stays put. That is success,
+  # not a failure; only a stuck dialog means the save really did not happen.
+  if dialog_open "${DISPLAY:-$DISPLAY_NUM}"; then
+    die "Ctrl+S opened a dialog instead of saving (ownership lost?) — pgctl repair"
+  fi
+  log "nothing to save ($(basename "$proj") unchanged)"
+  return 0
+}
+
+# The PNG panel is an in-app modal: after the shortcut it needs one click on its
+# render button (its label is localized; it is the only button in the panel) before
+# a save dialog appears. The panel is laid out from the window box, so the click
+# point is a fraction of the window size; these candidates cover the layouts seen
+# so far, and the caller retries if none of them lands.
+click_render_button() {
+  local disp=$1 geom w h c cx cy
+  geom=$(DISPLAY=$disp xdotool search --name "Project Graph" getwindowgeometry --shell 2>/dev/null)
+  w=$(sed -n 's/^WIDTH=//p' <<<"$geom"); h=$(sed -n 's/^HEIGHT=//p' <<<"$geom")
+  [[ -n ${w:-} && -n ${h:-} ]] || return 1
+  for c in "122 698" "122 620" "100 700" "146 560"; do
+    cx=$(( w * ${c% *} / 1000 )); cy=$(( h * ${c#* } / 1000 ))
+    (( cy > h - 20 )) && cy=$(( h - 20 ))
+    DISPLAY=$disp xdotool mousemove "$cx" "$cy" click 1
+    sleep 2
+    dialog_open "$disp" && return 0
+  done
+  return 1
+}
+
+cmd_export() {
+  local proj=${1:?project path required}
+  proj=$(readlink -f "$proj")
+  # Default output: inside the Hermes workspace (its root may hold directories
+  # only, so images land in Media/project-graph/). Override with an explicit path.
+  local out=${2:-$WORKSPACE/Media/project-graph/$(basename "${proj%.prg}").svg}
+  out=$(readlink -m "$out")
+  mkdir -p "$(dirname "$out")"
+  have xdotool || die "xdotool missing: apt-get install -y xdotool"
+  case $out in
+    *.svg) local key=ctrl+shift+e ;;
+    *.png) local key=ctrl+shift+p ;;
+    *) die "output must end in .svg or .png" ;;
+  esac
+  local open; open=$(cat "$OPEN_FILE" 2>/dev/null || true)
+  [[ $open == "$proj" ]] || die "open the project first: pgctl start $proj (currently: ${open:-none})"
+  app_pid >/dev/null || die "app not running: pgctl start $proj"
+  local disp=${DISPLAY:-$DISPLAY_NUM}
+  clear_dialogs "$disp"
+  rm -f "$out"
+  # A cold webview swallows the first key press, and the PNG panel needs a click
+  # before it shows a chooser — so retry the whole gesture rather than fail an
+  # export that would have worked a second later.
+  local dlg="" attempt
+  for attempt in 1 2 3; do
+    focus_window "$disp"
+    DISPLAY=$disp xdotool key --clearmodifiers "$key"
+    sleep 2
+    if [[ $out == *.png ]]; then
+      click_render_button "$disp" || true
+      sleep 2
+    fi
+    dlg=$(wait_dialog "$disp" 8) && break
+    log "export: no save dialog yet (attempt $attempt/3), retrying"
+  done
+  [[ -n $dlg ]] || die "no save dialog appeared (layout changed?) — try .svg, or work the menu by hand"
+
+  DISPLAY=$disp xdotool windowfocus --sync "$dlg" >/dev/null 2>&1 || \
+    DISPLAY=$disp xdotool windowactivate --sync "$dlg" >/dev/null 2>&1 || true
+  sleep 0.5
+  DISPLAY=$disp xdotool type --clearmodifiers --delay 30 "$out"
+  sleep 1
+  DISPLAY=$disp xdotool key --clearmodifiers Return
+  for _ in $(seq 1 40); do
+    [[ -s $out ]] && { touch "$ACTIVITY"; log "exported $(stat -c %s "$out") bytes → $out"; return 0; }
+    sleep 0.5
+  done
+  die "export produced no file: $out (dialog focus? try: pgctl export --debug)"
+}
+
+cmd_new() {
+  local out=${1:?path required}
+  local tpl="$TEMPLATES/starter.prg"
+  [[ -f $tpl ]] || die "missing template $tpl"
+  [[ -e $out ]] && die "$out already exists"
+  cp "$tpl" "$out"
+  log "created $out from starter template ($(stat -c %s "$out") bytes, 1 node n1)"
+  log "next: pgctl start $out  ->  pgctl tool expand_node_tree_from_node --project $out --input '{\"ref\":\"n1\",\"text\":\"child\"}'"
+}
+
+# Overwriting a .prg at an existing path leaves the reference store pointing at
+# uuids that no longer exist → every ref-based tool answers "stale_ref". Forget the
+# path (and its ownership records) so the file is re-registered from scratch.
+cmd_forget() {
+  local proj; proj=$(readlink -f "${1:?project path required}")
+  # Deleting ownership records under a live window makes the app lose ownership:
+  # Ctrl+S turns into a save-as dialog and the file stops updating.
+  if [[ $(cat "$OPEN_FILE" 2>/dev/null || true) == "$proj" ]]; then
+    die "$(basename "$proj") is open in the app — pgctl stop first, then forget"
+  fi
+  local store="$APPDATA/ai-project-references.json"
+  "$NODE" - "$store" "project:file://$proj:references" <<'JS'
+const fs = require("node:fs");
+const [file, key] = process.argv.slice(2);
+let d = {};
+try { d = JSON.parse(fs.readFileSync(file, "utf8")); } catch { d = {}; }
+const had = Object.hasOwn(d, key);
+delete d[key];
+fs.writeFileSync(file, JSON.stringify(d));
+process.stdout.write(had ? "removed" : "not present");
+JS
+  local h; h=$("$NODE" -e 'const c=require("node:crypto");process.stdout.write(c.createHash("sha256").update(process.argv[1]).digest("hex"))' "$proj")
+  rm -f "$APPDATA/project-ownership/$h".*
+  log "forgot $(basename "$proj") (reference + ownership records)"
+}
+
+cmd_doctor() {
+  local ok=0
+  chk() { if eval "$2" >/dev/null 2>&1; then echo "OK    $1"; else echo "MISS  $1 — $3"; ok=1; fi; }
+  chk "node >= 26 ($NODE)"            "'$NODE' -e 'process.exit(+process.versions.node.split(\".\")[0]>=26?0:1)'" "install node 26 or set PG_NODE"
+  chk "Xvfb"                          "command -v Xvfb"                                   "apt-get install -y xvfb"
+  chk "xdotool"                       "command -v xdotool"                                "apt-get install -y xdotool"
+  chk "libwebkit2gtk-4.1"             "ldconfig -p | grep -q libwebkit2gtk-4.1"           "apt-get install -y libwebkit2gtk-4.1-0"
+  chk "app binary"                    "test -x '$APP'"                                    "re-run install"
+  chk "cli bundle"                    "test -f '$CLI'"                                    "rebuild cli from source"
+  chk "jsdom (cli dep)"               "test -d '$ROOT/cli/node_modules/jsdom'"            "cd $ROOT/cli && npm i jsdom@29.1.1"
+  chk "ownership helper"              "test -x '$ROOT/cli/project-graph-ownership-helper'" "copy from the .deb payload"
+  return $ok
+}
+
+case ${1:-} in
+  start)    shift; cmd_start "$@" ;;
+  stop)     cmd_stop ;;
+  status)   cmd_status ;;
+  repair)   cmd_repair ;;
+  forget)   shift; cmd_forget "$@" ;;
+  tool)     shift; cmd_tool "$@" ;;
+  describe) shift; cmd_describe "$@" ;;
+  save)     shift; cmd_save "$@" ;;
+  export)   shift; cmd_export "$@" ;;
+  new)      shift; cmd_new "$@" ;;
+  doctor)   cmd_doctor ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

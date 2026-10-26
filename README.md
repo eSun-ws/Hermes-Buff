@@ -14,6 +14,7 @@ top-level `shared/` package rather than copied.
 |---|---|---|
 | [`hawkeye/`](hawkeye/) | Runs long, unattended tasks and kanban work outside of any single agent turn, reports progress back into the originating session, and recovers itself when the agent, the supervisor or the host dies. | Stable |
 | [`auxiliary-llm/`](auxiliary-llm/) | A self-hosted OpenAI-compatible inference stack — chat, embeddings and reranking from one llama.cpp build in three containers. Ships a one-shot `curl \| bash` installer. | Stable |
+| [`project-graph/`](project-graph/) | Drives the [Project Graph](https://github.com/graphif/project-graph) desktop node-graph editor headlessly: its 29 built-in tools over a CLI on a bare `Xvfb`, plus `.prg` → SVG/PNG export. Ships a one-shot installer and an agent skill. | Stable |
 
 ## Getting started
 
@@ -53,11 +54,12 @@ Hermes-Buff/
 ├── LICENSE              MIT, applies to every tool in this repository
 ├── README.md            this file
 ├── hawkeye/             long-running task supervision
-└── auxiliary-llm/       local inference stack (chat + embeddings + reranking)
+├── auxiliary-llm/       local inference stack (chat + embeddings + reranking)
+└── project-graph/       headless driver for the Project Graph node-graph editor
 ```
 
 Tools that can install themselves ship an `install.sh` at their root
-(`auxiliary-llm` is the first one). Everything else is copy-and-run; no tool
+(`auxiliary-llm` and `project-graph`). Everything else is copy-and-run; no tool
 needs to be installed into Hermes itself.
 
 Every tool subdirectory carries its own README with install, usage and
