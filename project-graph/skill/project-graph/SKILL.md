@@ -46,7 +46,7 @@ Put it under `HERMES_HOME`, never in a workspace or `/tmp`:
 
 ```bash
 H=${HERMES_HOME:?}
-D=$H/tools/project-graph-4.3.2-linux-x64
+D=$H/tools/project-graph-<version>-linux-x64
 apt-get install -y libwebkit2gtk-4.1-0 xvfb xdotool
 ```
 
@@ -84,7 +84,7 @@ With the app running and the project open, `pgctl tool` reaches those too (forwa
 ## Daily use
 
 ```bash
-D=$HERMES_HOME/tools/project-graph-4.3.2-linux-x64; P=$D/bin/pgctl
+D=$HERMES_HOME/tools/project-graph-<version>-linux-x64; P=$D/bin/pgctl
 
 $P new  /abs/dir/diagram.prg            # starter project (1 node, current format)
 $P start /abs/dir/diagram.prg           # Xvfb :99 + app; prints its deadline
@@ -94,7 +94,7 @@ $P tool expand_node_tree_from_node --project /abs/dir/diagram.prg \
      --input '{"ref":"n1","text":"requirements"}'
 $P save   /abs/dir/diagram.prg          # Ctrl+S — edits live in the app, not on disk
 $P export /abs/dir/diagram.prg          # → <workspace>/Media/project-graph/diagram.svg
-$P export /tmp/../diagram.prg out.png   # raster
+$P export /abs/dir/diagram.prg out.png # raster
 $P status                               # pids, project, idle/TTL, bridge health
 $P repair                               # restart the app after a wedged call
 $P stop                                 # kills app + Xvfb, then verifies
