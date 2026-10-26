@@ -40,6 +40,7 @@ APP_PID_FILE="$STATE/app.pid"
 XVFB_PID_FILE="$STATE/xvfb.pid"
 OPEN_FILE="$STATE/open-project"
 ACTIVITY="$STATE/last-activity"
+DIRTY_FILE="$STATE/unsaved-changes"
 LOG="$STATE/app.log"
 WATCHDOG_PID_FILE="$STATE/watchdog.pid"
 
@@ -329,6 +330,12 @@ cmd_tool() {
   local to=${PG_TOOL_TIMEOUT:-120}
   timeout --signal=TERM --kill-after=5 "$to" "$NODE" "$CLI" tool invoke "$name" "$@"
   local rc=$?
+  if (( rc == 0 )); then
+    case $name in
+      get_*|search_*|check_*|recognize_*|describe) : ;;
+      *) echo 1 >"$DIRTY_FILE" ;;   # a mutation landed in the app, not on disk
+    esac
+  fi
   if (( rc == 124 || rc == 137 )); then
     # A call left hanging holds the project's ownership lock, and every later call
     # then queues behind it. Clear the corpse; if the bridge itself is wedged the
@@ -343,22 +350,36 @@ cmd_describe() { "$NODE" "$CLI" tool describe "${1:?tool name required}"; }
 
 cmd_save() {
   local proj=${1:?project path required}
+  proj=$(readlink -f "$proj")
   local open; open=$(cat "$OPEN_FILE" 2>/dev/null || true)
-  [[ $open == "$(readlink -f "$proj")" ]] || die "that project is not the one open in the window ($open) — start it: pgctl start $proj"
+  [[ $open == "$proj" ]] || die "that project is not the one open in the window (${open:-none}) — start it: pgctl start $proj"
   have xdotool || die "xdotool missing: apt-get install -y xdotool"
-  local before after
-  focus_window
+  local disp=${DISPLAY:-$DISPLAY_NUM}
+  local before after attempt
   before=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
-  xdotool key --clearmodifiers ctrl+s
-  for _ in $(seq 1 20); do
-    after=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
-    (( after > before )) && { touch "$ACTIVITY"; log "saved ($(stat -c %s "$proj") bytes)"; return 0; }
-    sleep 0.5
+
+  for attempt in 1 2 3; do
+    # A leftover in-app panel (the PNG export panel stays open) swallows global
+    # shortcuts; Escape closes it before we try again.
+    (( attempt > 1 )) && { DISPLAY=$disp xdotool key --clearmodifiers Escape; sleep 0.5; }
+    focus_window "$disp"
+    DISPLAY=$disp xdotool key --clearmodifiers ctrl+s
+    for _ in $(seq 1 12); do
+      after=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
+      if (( after > before )); then
+        rm -f "$DIRTY_FILE"; touch "$ACTIVITY"
+        log "saved ($(stat -c %s "$proj") bytes)"
+        return 0
+      fi
+      sleep 0.5
+    done
+    dialog_open "$disp" && die "Ctrl+S opened a dialog instead of saving (ownership lost?) — pgctl repair"
   done
-  # No pending edits → Ctrl+S is a no-op and the mtime stays put. That is success,
-  # not a failure; only a stuck dialog means the save really did not happen.
-  if dialog_open "${DISPLAY:-$DISPLAY_NUM}"; then
-    die "Ctrl+S opened a dialog instead of saving (ownership lost?) — pgctl repair"
+
+  # The mtime did not move. That is only legitimate when nothing was changed since
+  # the last save — a mutation that never reached disk must fail loudly, not pass.
+  if [[ -f $DIRTY_FILE ]]; then
+    die "tool calls changed the project but Ctrl+S never reached the app — file NOT saved (try: pgctl repair, then save again)"
   fi
   log "nothing to save ($(basename "$proj") unchanged)"
   return 0
@@ -427,8 +448,19 @@ cmd_export() {
   DISPLAY=$disp xdotool type --clearmodifiers --delay 30 "$out"
   sleep 1
   DISPLAY=$disp xdotool key --clearmodifiers Return
-  for _ in $(seq 1 40); do
-    [[ -s $out ]] && { touch "$ACTIVITY"; log "exported $(stat -c %s "$out") bytes → $out"; return 0; }
+  local _i
+  for _i in $(seq 1 40); do
+    if [[ -s $out ]]; then
+      # The PNG panel does not close itself after saving, and while it is open the
+      # app ignores global shortcuts (Ctrl+S silently does nothing). Dismiss it.
+      if [[ $out == *.png ]]; then
+        DISPLAY=$disp xdotool key --clearmodifiers Escape
+        sleep 0.5
+      fi
+      touch "$ACTIVITY"
+      log "exported $(stat -c %s "$out") bytes -> $out"
+      return 0
+    fi
     sleep 0.5
   done
   die "export produced no file: $out (dialog focus? try: pgctl export --debug)"

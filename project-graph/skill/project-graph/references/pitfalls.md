@@ -71,6 +71,10 @@ Two more traps on the same path, both found by running the export immediately af
 - **`windowactivate` lies when there is no WM.** It prints a warning about
   `_NET_ACTIVE_WINDOW` but still exits 0, so a `windowactivate || windowfocus` fallback never
   runs and the focus never moves. Call `windowfocus` **unconditionally** after it.
+- **The PNG export panel stays open and swallows global shortcuts.** After it has written the
+  file, the panel remains on screen; while it is open the app ignores `Ctrl+S`, so the next save
+  does nothing and looks like "no changes". Dismiss it with `Escape` (this is why the panel-export
+  path must not be the last thing you do before saving).
 - **The first key press of a cold instance is swallowed.** The window exists before the webview
   has wired its keyboard handlers, so an export fired right after `start` opens nothing and a
   retry one second later succeeds. `pgctl` sleeps briefly in `start` and retries the whole
