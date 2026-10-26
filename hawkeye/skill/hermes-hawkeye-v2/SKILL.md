@@ -529,6 +529,19 @@ existing one. Five rules that cost the loop silently:
 - But **replacing the files of an already-enabled plugin does not reload it** — the
   gateway keeps running the old module. `disable` then `enable` to hot-load again;
   the copy inside the WebUI process needs a WebUI restart.
+- **A running watcher is a child of the process that armed it, so restarting that service kills the loop.**
+  `hk watch-file` armed from a WebUI session lives in the WebUI server's cgroup (`ss -ltnp | grep :<port>`,
+  then walk `PPid` of the watcher); `systemctl --user restart hermes-serve-webui` takes it down with the
+  service. Nothing re-launches it unless the doctor timer is actually installed — the unit under
+  `config/systemd/` is a template until `install.sh` renders it, so check `systemctl --user list-units | grep
+  hawkeye` before assuming a backstop exists. The signal file is append-only and the watcher polls its *size*,
+  so a later re-arm fires at once and replays whatever piled up: nothing is lost, but the monitor is silently
+  down until a turn re-arms it. After any restart that touches the arming process, read `hk status --all` and
+  say in the chat whether the watcher is armed.
+- **A wake turn carries the origin session's platform, not `cron`.** The wake is delivered into the session that
+  armed the watcher, so `agent_context`/`platform` are that session's (`webui`), and any per-platform policy —
+  memory retain gating, quotas, delivery adapters — that keys on `cron` never sees it. Key such policy on the
+  session id instead, and classify the turn by its prompt prefix (`[IMPORTANT: Background process proc…]`).
 - **A test can pass because the code it drives never ran**, a redirected install can rewrite the
   host's units, and a load harness can "prove" a race fixed without ever entering the window. All
   three live in `references/testing-and-release.md` (child-process liveness assertion, revert-callers
