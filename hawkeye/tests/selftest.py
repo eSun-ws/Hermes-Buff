@@ -264,6 +264,33 @@ def test_skill_ships_every_file_it_points_at() -> None:
           "skill install incomplete" in installer, "no runtime assertion in install.sh")
 
 
+def test_install_survives_a_symlinked_skill_document() -> None:
+    """A host that symlinks SKILL.md at its checkout must still get the helpers installed.
+
+    `cp -a` refuses with "are the same file", and the installer runs under `set -e`, so the skill step
+    aborted the whole run *before* the helper scripts were written -- the host kept an older
+    `wake-policy.py` while install.sh reported nothing wrong. Found by running it, not by reading it.
+    """
+    hk_root = Path(__file__).resolve().parents[1]
+    installer = hk_root / "install.sh"
+    home = BASE / "install-symlink"
+    dest = home / "skills" / "software-development" / "hermes-hawkeye-v2"
+    dest.mkdir(parents=True)
+    (dest / "SKILL.md").symlink_to(hk_root / "skill" / "hermes-hawkeye-v2" / "SKILL.md")
+    proc = subprocess.run([ "bash", str(installer), "--hermes-home", str(home),
+                            "--unit-dir", str(home / "systemd" / "user"), "--no-enable"],
+                          capture_output=True, text=True, timeout=300,
+                          env={**ENV, "HERMES_HOME": str(home)})
+    out = (proc.stdout or "") + (proc.stderr or "")
+    check("install: a symlinked SKILL.md does not abort the installer",
+          proc.returncode == 0 and "are the same file" not in out,
+          "rc=%d %s" % (proc.returncode, out[-200:]))
+    check("install: the helpers are written anyway",
+          all((home / "scripts" / name).is_file()
+              for name in ("wake-policy.py", "issue-tick.sh", "ledger-round.sh")),
+          str(sorted(p.name for p in (home / "scripts").iterdir())) if (home / "scripts").is_dir() else "no scripts dir")
+
+
 def test_doctor_notices_a_restart_that_dies_with_its_own_unit() -> None:
     """A restart doctor cannot keep alive must not be reported as a restart.
 
@@ -2862,6 +2889,7 @@ def main() -> int:
                  test_interpreter_probe_ignores_a_hostile_pythonpath,
                  test_hk_survives_a_lying_pythonpath_across_the_reexec,
                  test_gate_check_says_when_it_cannot_ask_the_cli,
+                 test_install_survives_a_symlinked_skill_document,
                  test_doctor_notices_a_restart_that_dies_with_its_own_unit,
                  test_status_says_whether_the_wake_channel_is_armed,
                  test_wake_policy_coalesces_and_never_drops_a_round,

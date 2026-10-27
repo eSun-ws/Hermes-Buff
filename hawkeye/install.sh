@@ -298,7 +298,17 @@ elif [ -d "$REPO_DIR/skill/hermes-hawkeye-v2" ]; then
     mkdir -p "$SKILL_DEST"
     # Copy the directory, not the entry file: SKILL.md points at references/*.md, and installing
     # only SKILL.md left those pointers dangling on every fresh host.
-    cp -a "$REPO_DIR/skill/hermes-hawkeye-v2/." "$SKILL_DEST/"
+    #
+    # A developer host often symlinks SKILL.md at the checkout so edits land in one place; `cp -a` then
+    # fails with "are the same file" and, because the installer runs with `set -e`, aborts the whole
+    # install before the helpers below are written. Skip what is already the same file.
+    if [ "$(readlink -f "$REPO_DIR/skill/hermes-hawkeye-v2/SKILL.md")" = \
+         "$(readlink -f "$SKILL_DEST/SKILL.md" 2>/dev/null || echo "")" ]; then
+        note "SKILL.md is already the same file as the checkout (symlinked); references still copied"
+        cp -a "$REPO_DIR/skill/hermes-hawkeye-v2/references/." "$SKILL_DEST/references/" 2>/dev/null || true
+    else
+        cp -a "$REPO_DIR/skill/hermes-hawkeye-v2/." "$SKILL_DEST/"
+    fi
     for ref in $(grep -o 'references/[A-Za-z0-9._-]*\.md' "$REPO_DIR/skill/hermes-hawkeye-v2/SKILL.md" | sort -u); do
         if [ ! -f "$SKILL_DEST/$ref" ]; then
             die "skill install incomplete: SKILL.md points at $ref but it was not installed"
