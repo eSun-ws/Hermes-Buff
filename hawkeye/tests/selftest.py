@@ -264,6 +264,68 @@ def test_skill_ships_every_file_it_points_at() -> None:
           "skill install incomplete" in installer, "no runtime assertion in install.sh")
 
 
+def test_doctor_notices_a_restart_that_dies_with_its_own_unit() -> None:
+    """A restart doctor cannot keep alive must not be reported as a restart.
+
+    Reported as #22: `_restart` spawned the phase with `start_new_session=True` inside the doctor
+    unit's cgroup, and the shipped unit is `Type=oneshot` with the default `KillMode=control-group`,
+    so systemd signalled the fresh child the instant the oneshot main process exited. `doctor` wrote
+    `phase_restart_by_doctor`, printed `restarted the supervisor`, and the run stayed dead -- recovery
+    is the reason doctor exists, and this made it a no-op that lied in the log.
+
+    Three things are asserted: the unit no longer lets systemd reap the child, a child that dies is
+    recorded as `restart_failed` with its stderr kept, and the row says so instead of blaming the
+    entry path.
+    """
+    hk_root = Path(__file__).resolve().parents[1]
+    unit = hk_root / "config" / "systemd" / "hawkeye-doctor.service"
+    text = unit.read_text() if unit.is_file() else ""
+    check("doctor: the shipped unit keeps the child alive past the oneshot (KillMode=process)",
+          "KillMode=process" in text, "unit has no KillMode=process")
+
+    # doctor.py imports its siblings relatively, so it has to come in as part of the package.
+    if str(hk_root / "lib") not in sys.path:
+        sys.path.insert(0, str(hk_root / "lib"))
+    from hawkeye import doctor as doc
+
+    rid = "probe-restart-dies"
+    rd = RUNS / rid
+    rd.mkdir(parents=True, exist_ok=True)
+    # An entry that exits immediately: the shape of a phase that systemd has just signalled.
+    entry = rd / "fake-hk"
+    entry.write_text("#!/bin/sh\necho 'phase: permission denied on state dir' >&2\nexit 1\n")
+    entry.chmod(0o755)
+    (rd / "meta.json").write_text(json.dumps({"kind": "exec", "entry": str(entry),
+                                             "argv": ["./bin/hk", "watch-file"]}))
+    (rd / "state.json").write_text(json.dumps({"finished": False}))
+    # Stale supervisor heartbeat: doctor classifies it as orphaned and tries to revive it.
+    (rd / "sup.heartbeat").write_text("beat")
+    old = 3600
+    os.utime(rd / "sup.heartbeat", (time.time() - old, time.time() - old))
+
+    cfg = {"sup_stale_seconds": 180, "wake_grace_seconds": 0.3, "max_restarts": 5,
+           "restart_grace_seconds": 0.6, "retention_days": 0}
+    os.environ["HAWKEYE_V2_ROOT"] = str(RUNS)
+    rows = doc.scan(cfg, fix=True)
+    os.environ.pop("HAWKEYE_V2_ROOT", None)
+    row = next((r for r in rows if r["run"] == rid), {})
+    events = []
+    ev = rd / "events.jsonl"
+    if ev.is_file():
+        events = [json.loads(line) for line in ev.read_text().splitlines() if line.strip()]
+    kinds = [e.get("kind") for e in events]
+    failed = [e for e in events if e.get("kind") == "phase_restart_failed"]
+    check("doctor: a spawned phase that dies is recorded as a failure, not a restart",
+          "phase_restart_failed" in kinds and "phase_restart_by_doctor" not in kinds, str(kinds))
+    check("doctor: the failure keeps the child's own stderr",
+          bool(failed) and "permission denied" in str(failed[0].get("stderr", "")),
+          str(failed[:1]))
+    check("doctor: the row says restart_failed and why",
+          row.get("status") == "restart_failed" and "did not survive" in str(row.get("action", "")),
+          "%s / %s" % (row.get("status"), row.get("action")))
+    shutil.rmtree(rd, ignore_errors=True)
+
+
 def test_status_says_whether_the_wake_channel_is_armed() -> None:
     """The loop has two halves and only one of them can reach a person.
 
@@ -2751,6 +2813,7 @@ def main() -> int:
                  test_interpreter_probe_ignores_a_hostile_pythonpath,
                  test_hk_survives_a_lying_pythonpath_across_the_reexec,
                  test_gate_check_says_when_it_cannot_ask_the_cli,
+                 test_doctor_notices_a_restart_that_dies_with_its_own_unit,
                  test_status_says_whether_the_wake_channel_is_armed,
                  test_wake_policy_coalesces_and_never_drops_a_round,
                  test_issue_tick_records_every_round_and_signals_only_on_a_verdict,

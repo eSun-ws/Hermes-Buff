@@ -47,7 +47,7 @@ def _prune_old_runs(cfg: dict) -> int:
     return removed
 
 
-def _restart(cfg: dict, rd: Path, meta: dict) -> Optional[int]:
+def _restart(cfg: dict, rd: Path, meta: dict) -> tuple[Optional[int], str]:
     """Restart a dead phase, but never in an unbounded loop.
 
     A phase that dies immediately would otherwise be respawned every doctor
@@ -56,18 +56,40 @@ def _restart(cfg: dict, rd: Path, meta: dict) -> Optional[int]:
     """
     entry = str(meta.get("entry") or "").strip()
     if not entry or not Path(entry).is_file():
-        return None
+        return None, "cannot restart (meta.entry missing)"
     # meta.json was read at scan time; if the run was deleted or renamed since (hk gc, a test
     # removing its root), spawning a phase here would recreate the directory and poll forever.
     if not (rd / store.META).is_file():
-        return None
+        return None, "cannot restart (run directory disappeared)"
     if _restart_count(rd) >= int(cfg.get("max_restarts", 5)):
-        return None
-    proc = subprocess.Popen([sys.executable, entry, "phase", "--run", rd.name],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+        return None, "restart budget exhausted"
+    # stderr used to go to DEVNULL, so a phase that refused to start left no reason behind: the
+    # event said "restarted" and the run stayed dead with nothing to read. Keep the first lines.
+    log = rd / "restart.stderr"
+    handle = open(log, "wb")
+    try:
+        proc = subprocess.Popen([sys.executable, entry, "phase", "--run", rd.name],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=handle, start_new_session=True)
+    finally:
+        handle.close()
+    # `start_new_session=True` detaches the session, not the cgroup: under the shipped unit
+    # (Type=oneshot, default KillMode=control-group) the child is signalled the instant the oneshot
+    # main process exits, so the event could be written for a restart that never lived. Verify the
+    # child instead of trusting the spawn, and record the failure with its own stderr.
+    time.sleep(float(cfg.get("restart_grace_seconds", 0.5)))
+    if not store.pid_alive(proc.pid):
+        tail = ""
+        try:
+            tail = log.read_text(errors="replace").strip()[-400:]
+        except OSError:
+            pass
+        store.append_event(rd, "phase_restart_failed", pid=proc.pid,
+                           exit_code=proc.poll(), stderr=tail)
+        return None, ("restart did not survive its unit (pid %d exited %s)%s"
+                      % (proc.pid, proc.poll(), ": " + tail.splitlines()[-1] if tail else ""))
     store.append_event(rd, "phase_restart_by_doctor", pid=proc.pid)
-    return proc.pid
+    return proc.pid, "restarted the supervisor"
 
 
 def _restart_count(rd: Path) -> int:
@@ -164,10 +186,14 @@ def scan(cfg: dict, fix: bool = False) -> list[dict[str, Any]]:
                     incident = True
                 status = "crash_loop"
                 action = "restart budget exhausted, stopped retrying and raised an incident"
-            elif _restart(cfg, rd, meta):
-                status, action = "restarted", "restarted the supervisor"
             else:
-                action = "cannot restart (meta.entry missing)"
+                pid, why = _restart(cfg, rd, meta)
+                if pid:
+                    status, action = "restarted", why
+                else:
+                    # A restart that dies with its own unit is not a failure to *find* the entry;
+                    # reporting one reason for both sent people looking in the wrong place.
+                    status, action = "restart_failed", why
 
         incident_doc = store.incident_active(rd)
         incident = bool(incident_doc)

@@ -328,8 +328,11 @@ cmd_tool() {
   [[ -n $proj ]] && prime "$proj"
   touch "$ACTIVITY"
   local to=${PG_TOOL_TIMEOUT:-120}
-  timeout --signal=TERM --kill-after=5 "$to" "$NODE" "$CLI" tool invoke "$name" "$@"
-  local rc=$?
+  # `set -e` aborts on the very line that fails, so `local rc=$?` never ran and the 124/137 handler
+  # below -- the one that clears a hung call's ownership lock -- was dead code. Capture the status
+  # instead of letting the shell exit on it.
+  local rc=0
+  timeout --signal=TERM --kill-after=5 "$to" "$NODE" "$CLI" tool invoke "$name" "$@" || rc=$?
   if (( rc == 0 )); then
     case $name in
       get_*|search_*|check_*|recognize_*|describe) : ;;
@@ -355,8 +358,13 @@ cmd_save() {
   [[ $open == "$proj" ]] || die "that project is not the one open in the window (${open:-none}) — start it: pgctl start $proj"
   have xdotool || die "xdotool missing: apt-get install -y xdotool"
   local disp=${DISPLAY:-$DISPLAY_NUM}
-  local before after attempt
-  before=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
+  # `stat -c %Y` is whole seconds, so a save landing in the same second as the sample reads as
+  # "unchanged": the DIRTY_FILE marker then survives a save that did reach the app, and the next save
+  # dies with "file NOT saved" on a file that is saved. A stamp file compared with `-nt` uses
+  # nanosecond mtimes -- finer than the thing being detected.
+  local after attempt
+  local stamp="$STATE/pgctl-save-stamp"
+  : > "$stamp"
 
   for attempt in 1 2 3; do
     # A leftover in-app panel (the PNG export panel stays open) swallows global
@@ -365,8 +373,8 @@ cmd_save() {
     focus_window "$disp"
     DISPLAY=$disp xdotool key --clearmodifiers ctrl+s
     for _ in $(seq 1 12); do
-      after=$(stat -c %Y "$proj" 2>/dev/null || echo 0)
-      if (( after > before )); then
+      after=$(stat -c %y "$proj" 2>/dev/null || echo)
+      if [[ -n $after && $proj -nt $stamp ]]; then
         rm -f "$DIRTY_FILE"; touch "$ACTIVITY"
         log "saved ($(stat -c %s "$proj") bytes)"
         return 0

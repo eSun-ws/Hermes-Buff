@@ -21,3 +21,8 @@ ExecStart=/opt/hawkeye/bin/hk doctor --fix
 # it is not a failure and must not flood the journal.
 SuccessExitStatus=0 1
 TimeoutStartSec=120
+# Default KillMode=control-group signals every process left in the unit's cgroup when the
+# oneshot main process exits -- including the phase doctor just spawned to revive a run
+# (start_new_session detaches the session, not the cgroup). The restart then dies in the
+# same instant it is recorded.
+KillMode=process
