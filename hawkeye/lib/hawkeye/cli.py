@@ -35,6 +35,9 @@ def _create(cfg: dict, args: argparse.Namespace, kind: str, extra: dict) -> str:
     if getattr(args, "report_interval", None) is not None:
         meta["overrides"] = {"report_interval_seconds": float(args.report_interval)}
     meta.update(extra)
+    channel = _run_wake_channel(meta)
+    if channel:
+        meta["wake_channel"] = channel
     store.write_json(rd / store.META, meta)
     # The run creator is the agent itself, so the first lease is written right here;
     # every later wake has to renew it with hk lease.
@@ -111,6 +114,28 @@ def _legacy_runs() -> list[Path]:
     return sorted(p for p in root.iterdir() if p.is_dir() and (p / store.META).is_file())
 
 
+def _run_wake_channel(meta: dict) -> dict | None:
+    """Where this run announces "the world changed" -- recorded at creation, inferred for old runs.
+
+    `wake_channel` is written into meta.json when the run is created, because the alternative (mining
+    `argv` for the `watch-file` subcommand and a positional `--path`) makes a display flag into an
+    interface: rename either and the status line silently reports `not armed` while an observer is
+    running. Runs created before this key existed fall back to the old inference, so nothing needs
+    migrating.
+    """
+    recorded = meta.get("wake_channel")
+    if isinstance(recorded, dict) and recorded.get("path"):
+        return recorded
+    argv = [str(a) for a in (meta.get("argv") or [])]
+    if "watch-file" not in argv:
+        return None
+    try:
+        path = argv[argv.index("--path") + 1]
+    except (ValueError, IndexError):
+        return None
+    return {"kind": "watch-file", "path": path}
+
+
 def _wake_channel(rows: list[dict]) -> str:
     """Say whether anything is actually watching for a signal, in one line.
 
@@ -124,14 +149,10 @@ def _wake_channel(rows: list[dict]) -> str:
     for row in rows:
         if row.get("status") != "running":
             continue
-        argv = row.get("argv") or []
-        if "watch-file" not in argv:
+        channel = row.get("wake_channel")
+        if not channel:
             continue
-        try:
-            path = argv[argv.index("--path") + 1]
-        except (ValueError, IndexError):
-            path = "(unknown path)"
-        armed.append("%s watching %s" % (row["run"], path))
+        armed.append("%s watching %s" % (row["run"], channel.get("path") or "(unknown path)"))
     if armed:
         # Every armed observer, not just the first: several loops can be armed at once, and naming
         # one of them would make the others invisible again.
@@ -218,9 +239,9 @@ def _describe(rid: str) -> dict:
         "incident": incident or None,          # raw document, audit trail included
         "incident_open": incident_open,
         "note": ", ".join(notes),
-        # The argv is here so `status` can answer "is anything actually watching?" instead of
-        # leaving that to `ps`.
-        "argv": list(meta.get("argv") or []),
+        # The channel is part of the run's identity, not a parsing trick over argv, and it is the only
+        # thing the status footer needs.
+        "wake_channel": _run_wake_channel(meta),
     }
 
 

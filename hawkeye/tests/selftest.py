@@ -264,6 +264,34 @@ def test_skill_ships_every_file_it_points_at() -> None:
           "skill install incomplete" in installer, "no runtime assertion in install.sh")
 
 
+def test_run_records_its_wake_channel_at_creation() -> None:
+    """The channel is recorded where the run is born, so `status` reads a fact instead of guessing.
+
+    `watch-file` and `--path` are flag spellings; treating them as an interface meant a rename, a
+    `--path=<x>` form, or a wrapper script turned a live observer into `not armed` -- the exact failure
+    the line exists to catch.
+    """
+    root = BASE / "wake-channel-root"
+    root.mkdir(exist_ok=True)
+    conf = cfg("wake-channel")
+    rid = "probe-records-channel"
+    cmd = [sys.executable, str(HK), "run", "--id", rid, "--",
+           sys.executable, str(HK), "watch-file", "--path", "/tmp/rec.md", "--interval", "1",
+           "--ttl", "6", "--name", "rec"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                          env={**ENV, "HAWKEYE_V2_ROOT": str(root),
+                               "HAWKEYE_V2_CONFIG": str(conf)})
+    meta_path = root / rid / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    check("run: the wake channel is recorded in meta.json at creation",
+          proc.returncode == 0 and (meta.get("wake_channel") or {}).get("path") == "/tmp/rec.md",
+          "rc=%d channel=%s" % (proc.returncode, meta.get("wake_channel")))
+    subprocess.run([sys.executable, str(HK), "stop", "--run", rid], capture_output=True, text=True,
+                   timeout=120, env={**ENV, "HAWKEYE_V2_ROOT": str(root),
+                                     "HAWKEYE_V2_CONFIG": str(conf)})
+    shutil.rmtree(root / rid, ignore_errors=True)
+
+
 def test_install_survives_a_symlinked_skill_document() -> None:
     """A host that symlinks SKILL.md at its checkout must still get the helpers installed.
 
@@ -413,6 +441,26 @@ def test_status_says_whether_the_wake_channel_is_armed() -> None:
           "wake channel: armed" in armed.stdout and rid in armed.stdout
           and "/tmp/signal.md" in armed.stdout, (armed.stdout or "")[-200:])
     shutil.rmtree(rd, ignore_errors=True)
+
+    # A run that *records* its channel needs no argv archaeology, and a run whose argv says nothing
+    # (a wrapper, a shell loop) is still recognisable when it recorded the fact at creation.
+    rid2 = "probe-recorded-channel"
+    rd2 = root / rid2
+    rd2.mkdir(parents=True, exist_ok=True)
+    (rd2 / "meta.json").write_text(json.dumps({
+        "kind": "exec",
+        "wake_channel": {"kind": "watch-file", "path": "/tmp/recorded.md"}}))
+    (rd2 / "sup.heartbeat").write_text("beat")
+    recorded = subprocess.run([sys.executable, str(cli), "status"], capture_output=True, text=True,
+                              env=env, timeout=120)
+    check("status: a recorded channel is reported without reading argv",
+          "wake channel: armed" in recorded.stdout and rid2 in recorded.stdout
+          and "/tmp/recorded.md" in recorded.stdout, (recorded.stdout or "")[-200:])
+    check("status: argv is not part of the published row any more",
+          '"argv"' not in subprocess.run([sys.executable, str(cli), "status", "--all", "--json"],
+                                         capture_output=True, text=True, env=env,
+                                         timeout=120).stdout, "argv still in the json row")
+    shutil.rmtree(rd2, ignore_errors=True)
 
 
 def test_wake_policy_coalesces_and_never_drops_a_round() -> None:
@@ -2889,6 +2937,7 @@ def main() -> int:
                  test_interpreter_probe_ignores_a_hostile_pythonpath,
                  test_hk_survives_a_lying_pythonpath_across_the_reexec,
                  test_gate_check_says_when_it_cannot_ask_the_cli,
+                 test_run_records_its_wake_channel_at_creation,
                  test_install_survives_a_symlinked_skill_document,
                  test_doctor_notices_a_restart_that_dies_with_its_own_unit,
                  test_status_says_whether_the_wake_channel_is_armed,
