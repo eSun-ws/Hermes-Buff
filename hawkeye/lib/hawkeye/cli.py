@@ -146,17 +146,16 @@ def cmd_status(args: argparse.Namespace, cfg: dict) -> int:
     rows = []
     for rid in targets:
         rows.append(_describe(rid))
-    # `hk status` with no --run shows nothing, but the wake question is about the whole host: an
-    # observer armed an hour ago in another window is exactly what makes a dead loop hard to see.
-    wake_rows = rows
-    if not getattr(args, "all", False):
-        root = store.run_root()
-        if root.is_dir():
-            wake_rows = [_describe(p.name) for p in sorted(root.iterdir())
-                         if (p / store.META).is_file()]
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
+    # The footer is about the whole host -- an observer armed an hour ago in another window is exactly
+    # what makes a dead loop hard to see -- but the scan belongs *after* the machine path returns, and
+    # a run already described above must not be described twice.
+    wake_rows = rows
+    if not getattr(args, "all", False):
+        described = {row["run"]: row for row in rows}
+        wake_rows = [described.get(rid) or _describe(rid) for rid in _all_run_ids()]
     if not rows:
         print("(no runs)")
         print("wake channel: " + _wake_channel(wake_rows))
@@ -185,7 +184,8 @@ def _describe(rid: str) -> dict:
     state = store.read_json(rd / store.STATE, {}) or {}
     result = store.read_json(rd / store.RESULT, {}) or {}
     incident = store.read_json(rd / store.INCIDENT, {}) or {}
-    incident_open = bool(store.incident_active(rd))
+    # Same rule as store.incident_active, without re-opening and re-parsing the file we already hold.
+    incident_open = bool(incident) and not incident.get("withdrawn_at")
     sup_age = store.mtime_age(rd / store.SUP_BEAT)
     lease = store.read_json(rd / store.LEASE, {}) or {}
     seen = float(lease.get("agent_seen") or 0)
@@ -452,12 +452,22 @@ def cmd_gc(args: argparse.Namespace, cfg: dict) -> int:
     return 0
 
 
+def _all_run_ids() -> list[str]:
+    """Every run directory under the run root, sorted by name.
+
+    One definition, because "what counts as a run" was being spelled out in three places (here, the
+    status footer, and `_legacy_runs`) and any drift between them makes a run invisible to one command
+    and visible to another.
+    """
+    root = store.run_root()
+    if not root.is_dir():
+        return []
+    return [p.name for p in sorted(root.iterdir()) if (p / store.META).is_file()]
+
+
 def _targets(args: argparse.Namespace) -> list[str]:
     if getattr(args, "all", False):
-        root = store.run_root()
-        if not root.is_dir():
-            return []
-        return [p.name for p in sorted(root.iterdir()) if (p / store.META).is_file()]
+        return _all_run_ids()
     rid = getattr(args, "run", None)
     return [rid] if rid else []
 

@@ -30,7 +30,8 @@ _pick() {
 }
 WATCH="$(_pick issue-watch.py "${IW_WATCH:-}")"
 POLICY="$(_pick wake-policy.py "${IW_POLICY:-}")"
-LEDGER_ROUND="${IW_LEDGER_ROUND:-$SHIP_DIR/ledger-round.sh}"
+# Same resolution as WATCH/POLICY: a stale $HERMES_HOME copy must not shadow a fix in the checkout.
+LEDGER_ROUND="$(_pick ledger-round.sh "${IW_LEDGER_ROUND:-}")"
 LEDGER="${IW_LEDGER:-}"
 IGNORE_AUTHORS="${IW_IGNORE_AUTHORS:-eSun-ws}"
 WORK="${IW_WORK:-$HOME_DIR/cache/hawkeye/issue-ledger}"
@@ -73,8 +74,14 @@ else
   echo "issue-tick: IW_LEDGER not set or $LEDGER_ROUND not executable; detection recorded only on disk" >&2
 fi
 
-verdict="$(python3 "$POLICY" --state "$POLICY_STATE" --items "$ENTRY" \
-  --self "${IW_SELF:-${IGNORE_AUTHORS%%,*}}" 2>>"$WORK/tick.log" | head -1)"
+# No pipe: `| head -1` made the pipeline's status that of `head`, so the policy's own refusal
+# (exit 1 on a corrupt state file, exactly so the cooldown is not reset) looked like an empty
+# verdict -- and the fallback branch below then signalled a wake on every tick, reinstating the
+# unconditional `>> signal.md` this script was written to remove.
+policy_out="$(python3 "$POLICY" --state "$POLICY_STATE" --items "$ENTRY" \
+  --self "${IW_SELF:-${IGNORE_AUTHORS%%,*}}" 2>>"$WORK/tick.log")"
+policy_rc=$?
+verdict="$(printf '%s\n' "$policy_out" | head -1)"
 case "$verdict" in
   wake*)
     # Append, never rewrite: the watcher polls the file size.
@@ -85,10 +92,26 @@ case "$verdict" in
     echo "issue-tick: held the wake -- ${verdict#hold }" >&2
     ;;
   *)
-    # Never swallow a detection because the policy could not answer: an unknown verdict wakes, and
-    # the reason says why it did.
-    printf '%s policy unavailable, waking\n' "$(date -u +%FT%TZ)" >> "$SIGNAL"
-    echo "issue-tick: wake-policy gave no verdict (${verdict:-empty}); signalled anyway" >&2
+    if [ "$policy_rc" -ne 0 ]; then
+      # The policy could not answer (corrupt state, missing file). The round is already in the ledger,
+      # so holding loses nothing; waking on every tick would lose the cooldown instead. Report the
+      # broken state once per window so it stays visible instead of silent.
+      marker="$WORK/policy-broken"
+      age=$(( $(date +%s) - $(stat -c %Y "$marker" 2>/dev/null || echo 0) ))
+      if [ ! -f "$marker" ] || [ "$age" -ge "${IW_WAKE_MIN_INTERVAL:-3600}" ]; then
+        printf '%s wake-policy unavailable (rc=%s) -- fix %s\n' \
+          "$(date -u +%FT%TZ)" "$policy_rc" "$POLICY_STATE" >> "$SIGNAL"
+        touch "$marker"
+        echo "issue-tick: policy exited $policy_rc; waking ONCE to report the broken state" >&2
+      else
+        echo "issue-tick: policy exited $policy_rc; still inside the report window (${age}s) -- holding" >&2
+      fi
+    else
+      # The policy ran and answered with something unrecognisable: that is its bug, not a state we can
+      # judge, so surface it rather than swallow the round.
+      printf '%s policy verdict unreadable, waking\n' "$(date -u +%FT%TZ)" >> "$SIGNAL"
+      echo "issue-tick: wake-policy gave no verdict (${verdict:-empty}); signalled anyway" >&2
+    fi
     ;;
 esac
 exit 0

@@ -61,29 +61,34 @@ def _restart(cfg: dict, rd: Path, meta: dict) -> tuple[Optional[int], str]:
     # removing its root), spawning a phase here would recreate the directory and poll forever.
     if not (rd / store.META).is_file():
         return None, "cannot restart (run directory disappeared)"
-    if _restart_count(rd) >= int(cfg.get("max_restarts", 5)):
-        return None, "restart budget exhausted"
+    # The budget is checked by the caller (`_crash_loop_hit`), which owns the incident; duplicating it
+    # here made a branch that could never be reached and two places to keep in step.
     # stderr used to go to DEVNULL, so a phase that refused to start left no reason behind: the
     # event said "restarted" and the run stayed dead with nothing to read. Keep the first lines.
-    log = rd / "restart.stderr"
-    handle = open(log, "wb")
+    log = rd / store.RESTART_LOG
     try:
-        proc = subprocess.Popen([sys.executable, entry, "phase", "--run", rd.name],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=handle, start_new_session=True)
-    finally:
-        handle.close()
+        handle = open(log, "wb")
+        try:
+            proc = subprocess.Popen([sys.executable, entry, "phase", "--run", rd.name],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=handle, start_new_session=True)
+        finally:
+            handle.close()
+    except OSError as exc:
+        # `hk gc` can remove the run between the checks above and this open. One vanished run must not
+        # abort the sweep: every later orphan would then go unsupervised until the next tick.
+        return None, "cannot spawn the phase: %s" % exc
     # `start_new_session=True` detaches the session, not the cgroup: under the shipped unit
     # (Type=oneshot, default KillMode=control-group) the child is signalled the instant the oneshot
     # main process exits, so the event could be written for a restart that never lived. Verify the
     # child instead of trusting the spawn, and record the failure with its own stderr.
-    time.sleep(float(cfg.get("restart_grace_seconds", 0.5)))
+    # Poll instead of sleeping the whole grace: a child that is already gone should not cost the sweep
+    # the full window, and a crash loop of five runs should not add 2.5s of pure sleep per tick.
+    deadline = time.monotonic() + float(cfg["restart_grace_seconds"])
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.025)
     if not store.pid_alive(proc.pid):
-        tail = ""
-        try:
-            tail = log.read_text(errors="replace").strip()[-400:]
-        except OSError:
-            pass
+        tail = store.tail(log, 4096).strip()[-400:]
         store.append_event(rd, "phase_restart_failed", pid=proc.pid,
                            exit_code=proc.poll(), stderr=tail)
         return None, ("restart did not survive its unit (pid %d exited %s)%s"
@@ -93,11 +98,19 @@ def _restart(cfg: dict, rd: Path, meta: dict) -> tuple[Optional[int], str]:
 
 
 def _restart_count(rd: Path) -> int:
-    return len(store.read_events(rd, kind="phase_restart_by_doctor"))
+    """Restart *attempts*, whatever their outcome.
+
+    Counting only the successful ones (#22's `phase_restart_by_doctor`) meant a restart that dies with
+    its unit never consumed the budget and never tripped the crash-loop incident -- so a permanently
+    broken run was respawned on every sweep, forever, while doctor reported a plain `restart_failed`.
+    """
+    events = store.read_events(rd)
+    return sum(1 for e in events if e.get("kind") in ("phase_restart_by_doctor",
+                                                     "phase_restart_failed"))
 
 
 def _crash_loop_hit(cfg: dict, rd: Path) -> bool:
-    return _restart_count(rd) >= int(cfg.get("max_restarts", 5))
+    return _restart_count(rd) >= int(cfg["max_restarts"])
 
 
 def _age_text(age: float) -> str:

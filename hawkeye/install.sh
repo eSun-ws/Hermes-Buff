@@ -308,10 +308,21 @@ elif [ -d "$REPO_DIR/skill/hermes-hawkeye-v2" ]; then
     # too: a fresh host otherwise had a rule pointing at a script that existed only in the repository
     # (issue #17, and the report that followed it).
     mkdir -p "$HERMES_HOME/scripts"
-    for tool in ledger-round.sh issue-tick.sh wake-policy.py issue-watch.py; do
+    # One list, and everything in config/scripts/ must be on it: a hand-maintained list beside a
+    # doc-derived check is how a helper ends up "installed" but never verified (issue #17's shape).
+    INSTALLED_HELPERS="decisions.py issue-tick.sh issue-watch.py ledger-round.sh wake-policy.py"
+    # Run only while installing (they inspect the host from the checkout); no reason to ship them.
+    BUILD_ONLY_HELPERS="kernel-probe.py"
+    for tool in $(cd "$REPO_DIR/config/scripts" && ls -1 | grep -E '\.(sh|py)$'); do
+        case " $INSTALLED_HELPERS $BUILD_ONLY_HELPERS " in
+            *" $tool "*) : ;;
+            *) die "config/scripts/$tool is in neither list: a fresh host would miss it, or the list is stale" ;;
+        esac
+    done
+    for tool in $INSTALLED_HELPERS; do
         install -m 755 "$REPO_DIR/config/scripts/$tool" "$HERMES_HOME/scripts/$tool"
     done
-    for tool in $(grep -o 'config/scripts/[A-Za-z0-9._-]*\.sh' "$REPO_DIR/skill/hermes-hawkeye-v2/SKILL.md" | sort -u); do
+    for tool in $(grep -oE 'config/scripts/[A-Za-z0-9._-]*\.(sh|py)' "$REPO_DIR/skill/hermes-hawkeye-v2/SKILL.md" | sort -u); do
         if [ ! -x "$HERMES_HOME/scripts/$(basename "$tool")" ]; then
             die "skill install incomplete: SKILL.md points at $tool but it was not installed"
         fi

@@ -28,7 +28,8 @@ DEFAULTS: dict[str, Any] = {
     "wake_grace_seconds": 900.0,    # agent must renew its lease within this after a report
     "sup_stale_seconds": 180.0,     # doctor treats a phase silent this long as dead
     "max_wakes": 6,                 # hard budget per run (kernel allows 8 watch hits/session)
-    "max_restarts": 5,
+    "max_restarts": 5,              # restart *attempts* doctor may spend on one run (any outcome)
+    "restart_grace_seconds": 0.5,   # how long a spawned phase gets to prove it survived its unit
     # finished run directories older than this are pruned by the doctor sweep (0 disables);
     # without it cache/hawkeye/runs grows for the life of the host
     "retention_days": 7.0,

@@ -28,6 +28,7 @@ SUP_BEAT = "sup.heartbeat"
 JOB_PID = "job.pid"
 JOB_EXIT = "job.exit"
 JOB_BEAT = "job.heartbeat"
+RESTART_LOG = "restart.stderr"     # why a doctor-spawned phase did not come up
 LOCK = ".lock"
 
 

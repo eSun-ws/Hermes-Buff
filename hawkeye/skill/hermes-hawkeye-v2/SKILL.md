@@ -285,7 +285,8 @@ one model, treat the first two as mandatory.
   scheduled, build both and split by role: cron with `no_agent: true` + a script is visible, costs
   0 tokens and opens **no** session at all (measured: a silent tick took 3.4 s, 0 API calls, the
   session table unchanged), so it detects, appends the finding with `hk report --into <ledger>` and
-  appends one line to a signal file; `hk run -- <hk watch-file --path <signal>>` turns a change to
+  asks `wake-policy.py` whether this round may wake anyone, and appends one line to a signal file only
+  when it may (a held round is still recorded in the ledger); `hk run -- <hk watch-file --path <signal>>` turns a change to
   that file into the wake. One ledger, one signal, no window on either side; the wake turn re-arms
   the watcher half. Mechanics and the measured numbers are in `references/in-session-watch.md`.
 - **A delegated fix is a claim until you re-derive it.** When an autonomous loop (cron, a worker, a
@@ -446,10 +447,11 @@ default, an explicit `0` means "no grace").
 Inbound reports on the public repo are watched by a **bounded in-session watcher**:
 `hk run --id <id> -- <script>` where the script polls `issue-watch.py --json` every few minutes
 (deterministic and read-only, so an unchanged repo produces an identical tick — 0 tokens) and
-prints one milestone line on news **or** on TTL expiry. `templates/ledger-watch.sh` is that loop with
-the rules already baked in (heartbeat, record-then-exit, seen-state, explicit poll-failure
-lines); copy it and replace the poll command and the ledger id. For the cron-split shape the same
-script is the cron `no_agent` script, and `hk watch-file` is armed on the signal file it touches. The wake then lands in the chat that
+prints one milestone line on news **or** on TTL expiry. `config/scripts/issue-tick.sh` is that loop
+with the rules already baked in -- heartbeat, record-then-exit, seen-state, explicit poll-failure
+lines -- and it ships with the tick (there is no `templates/` directory to copy from). For the
+cron-split shape it *is* the cron `no_agent` script, and `hk watch-file` is armed on the signal file
+it touches. The wake then lands in the chat that
 armed it, and the window always closes with a question instead of going quiet. cron is only for
 "nobody is here to see it": every fire opens a NEW session window and cannot deliver into an
 existing one. Five rules that cost the loop silently:

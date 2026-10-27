@@ -80,17 +80,20 @@ def _write_state(path: str, state: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=1)
         handle.write("\n")
+        # Without this a crash can leave a zero-length file, and a zero-length file is unparseable --
+        # i.e. the state this module says it must refuse. Durability here is not cosmetic.
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
 
 
-def _who(item: dict, self_login: str) -> str:
+def _who(item: dict, logins: list[str], self_login: str) -> str:
     """Name the person who spoke, not the first comment in the list.
 
     A round often mixes our own reply with theirs; printing ``by eSun-ws`` for such a pair reads like
     an echo of ourselves and makes the wake look pointless, which is how a wake message loses its
     reader. The other party is the reason to wake, so say that first.
     """
-    logins = _commenters(item)
     others = [name for name in logins if name.lower() != (self_login or "").lower()]
     shown = []
     for name in (others or logins):
@@ -104,7 +107,10 @@ def _who(item: dict, self_login: str) -> str:
 def decide(items: list[dict], state: dict, now: datetime, interval: int,
            self_login: str = "") -> tuple[str, str, dict]:
     fresh = [item for item in items if item.get("first_seen")]
-    replies = [item for item in items if not item.get("first_seen") and _commenters(item)]
+    # One walk per item: the caller used to ask `_commenters(item)` twice per reply (once for the
+    # truthiness test, once for the name).
+    replies = [(item, logins) for item in items if not item.get("first_seen")
+               for logins in (_commenters(item),) if logins]
 
     pending = int(state.get("pending") or 0) + len(items)
     last_wake = state.get("last_wake_at")
@@ -123,7 +129,8 @@ def decide(items: list[dict], state: dict, now: datetime, interval: int,
     if replies:
         reason_parts.append("%d repl%s (%s)" % (
             len(replies), "y" if len(replies) == 1 else "ies",
-            ",".join("#%s by %s" % (item.get("number"), _who(item, self_login)) for item in replies[:4])))
+            ",".join("#%s by %s" % (item.get("number"), _who(item, logins, self_login))
+                     for item, logins in replies[:4])))
     detail = "; ".join(reason_parts) or "activity"
 
     if fresh:
@@ -142,8 +149,13 @@ def decide(items: list[dict], state: dict, now: datetime, interval: int,
             detail, quiet_for.total_seconds(), wait, pending)
 
     if verdict == "wake":
+        # `pending` is the point of coalescing, so the wake has to say how much it speaks for. It used
+        # to be zeroed silently and the reader saw one round when three had arrived.
+        absorbed = pending - len(items)
+        if absorbed > 0:
+            why = "%s (this wake covers %d earlier round%s)" % (
+                why, absorbed, "" if absorbed == 1 else "s")
         state["last_wake_at"] = now.isoformat()
-        state["last_wake_reason"] = detail
         state["pending"] = 0
         state["wakes"] = int(state.get("wakes") or 0) + 1
     else:

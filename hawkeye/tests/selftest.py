@@ -309,12 +309,9 @@ def test_doctor_notices_a_restart_that_dies_with_its_own_unit() -> None:
     rows = doc.scan(cfg, fix=True)
     os.environ.pop("HAWKEYE_V2_ROOT", None)
     row = next((r for r in rows if r["run"] == rid), {})
-    events = []
-    ev = rd / "events.jsonl"
-    if ev.is_file():
-        events = [json.loads(line) for line in ev.read_text().splitlines() if line.strip()]
-    kinds = [e.get("kind") for e in events]
-    failed = [e for e in events if e.get("kind") == "phase_restart_failed"]
+    seen_events = events(rid)
+    kinds = [e.get("kind") for e in seen_events]
+    failed = [e for e in seen_events if e.get("kind") == "phase_restart_failed"]
     check("doctor: a spawned phase that dies is recorded as a failure, not a restart",
           "phase_restart_failed" in kinds and "phase_restart_by_doctor" not in kinds, str(kinds))
     check("doctor: the failure keeps the child's own stderr",
@@ -323,6 +320,36 @@ def test_doctor_notices_a_restart_that_dies_with_its_own_unit() -> None:
     check("doctor: the row says restart_failed and why",
           row.get("status") == "restart_failed" and "did not survive" in str(row.get("action", "")),
           "%s / %s" % (row.get("status"), row.get("action")))
+    # The budget has to count *attempts*: counting only the successful restarts meant a run whose
+    # phase can never start was respawned on every sweep forever, with no incident and no visible
+    # end (the budget is doctor's loudest promise).
+    rid2 = "probe-restart-budget"
+    rd2 = RUNS / rid2
+    rd2.mkdir(parents=True, exist_ok=True)
+    entry2 = rd2 / "fake-hk"
+    entry2.write_text("#!/bin/sh\nexit 1\n")
+    entry2.chmod(0o755)
+    (rd2 / "meta.json").write_text(json.dumps({"kind": "exec", "entry": str(entry2),
+                                              "argv": ["./bin/hk", "watch-file"]}))
+    (rd2 / "state.json").write_text(json.dumps({"finished": False}))
+    (rd2 / "sup.heartbeat").write_text("beat")
+    os.utime(rd2 / "sup.heartbeat", (time.time() - old, time.time() - old))
+    tight = dict(cfg, max_restarts=1)
+    os.environ["HAWKEYE_V2_ROOT"] = str(RUNS)
+    doc.scan(tight, fix=True)          # attempt 1: spawns, the child dies
+    rows2 = doc.scan(tight, fix=True)  # attempt budget now spent -> incident, not another spawn
+    os.environ.pop("HAWKEYE_V2_ROOT", None)
+    row2 = next((r for r in rows2 if r["run"] == rid2), {})
+    attempts = sum(1 for e in events(rid2)
+                   if e.get("kind") in ("phase_restart_by_doctor", "phase_restart_failed"))
+    check("doctor: a failed restart still consumes the budget",
+          attempts == 1, "attempts counted=%d" % attempts)
+    check("doctor: an exhausted budget becomes a crash-loop incident, not another spawn",
+          row2.get("status") == "crash_loop" and row2.get("incident") is True
+          and "budget" in str(row2.get("action", "")), "%s / %s" % (row2.get("status"), row2.get("action")))
+    shutil.rmtree(rd2, ignore_errors=True)
+
+
     shutil.rmtree(rd, ignore_errors=True)
 
 
@@ -410,6 +437,10 @@ def test_wake_policy_coalesces_and_never_drops_a_round() -> None:
     drained = json.loads(state.read_text())
     check("wake-policy: the wake drains the pending count",
           drained.get("pending") == 0 and drained.get("wakes") == 2, json.dumps(drained))
+    # Coalescing is only honest if the wake says how much it stands for; the reader used to see one
+    # round when two had been held.
+    check("wake-policy: the wake says how many earlier rounds it covers",
+          "covers 1 earlier round" in later.stdout, (later.stdout or "")[:140])
 
     before = state.read_text()
     dry = subprocess.run([sys.executable, str(policy), "--state", str(state),
@@ -476,6 +507,24 @@ def test_issue_tick_records_every_round_and_signals_only_on_a_verdict() -> None:
     check("issue-tick: both rounds were recorded even though only one woke anyone",
           rounds.is_file() and len(rounds.read_text().strip().splitlines()) == 2,
           rounds.read_text() if rounds.is_file() else "missing")
+
+    # A policy that refuses (corrupt state) must not be turned into a wake by the caller: that is the
+    # unconditional `>> signal.md` this script replaced, wearing a different hat. It reports the broken
+    # state once per window and holds in between.
+    (home / "cache" / "hawkeye" / "issue-ledger" / "wake.json").write_text("{bad")
+    before = signal.stat().st_size
+    once = once_tick = subprocess.run(["bash", str(tick)], capture_output=True, text=True,
+                                      env=env, timeout=120)
+    after_first = signal.stat().st_size
+    twice = subprocess.run(["bash", str(tick)], capture_output=True, text=True, env=env, timeout=120)
+    after_second = signal.stat().st_size
+    tail = signal.read_text().splitlines()[-1] if after_first > before else ""
+    check("issue-tick: a refusing policy does not signal a wake",
+          after_first > before and "wake-policy unavailable" in tail,
+          "size %d->%d last=%r" % (before, after_first, tail))
+    check("issue-tick: the broken policy is reported once, not on every tick",
+          after_second == after_first and "inside the report window" in (twice.stderr or ""),
+          "size %d->%d err=%s" % (after_first, after_second, (twice.stderr or "")[-120:]))
 
 
 def test_watch_file_exits_when_the_producer_writes() -> None:
