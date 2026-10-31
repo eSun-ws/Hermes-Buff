@@ -70,6 +70,14 @@ class Phase:
             if self.state.get("finished"):
                 return 0
             store.append_event(self.rd, "phase_start", pid=os.getpid())
+            # Who started this supervisor decides whether its exit can wake anybody: a phase spawned
+            # by doctor's `_restart` is a child of the oneshot doctor unit, with no terminal session
+            # behind it, so it is supervised but silent (#22). Recorded here rather than inferred from
+            # the event log, because both paths write `phase_start` and it carries only a pid.
+            try:
+                self._set(phase_origin=self._origin())
+            except _Stopped:
+                return 0          # a stop landed before the first tick; nothing to supervise
             while True:
                 # A run whose meta.json is gone was deleted underneath us (hk gc, a test that
                 # removed its temp root). store.run_lock() recreates the directory on every
@@ -98,6 +106,17 @@ class Phase:
                 except _Stopped:
                     return self._exit_stopped()
                 time.sleep(float(self.cfg["poll_seconds"]))
+
+    def _origin(self) -> str:
+        """How this supervisor was started: by the session that armed the run, or by doctor.
+
+        A doctor restart restores *supervision*, not the wake channel: the wake is a property of the
+        terminal session that created the run, and a child of the oneshot doctor unit has none. The
+        two states have to be tellable apart, or `hk status` reports `armed` for a loop that will
+        never reach a person (#22).
+        """
+        marker = str(os.environ.get("HAWKEYE_PHASE_ORIGIN") or "").strip().lower()
+        return "doctor" if marker == "doctor" else "session"
 
     def _beat(self) -> None:
         try:

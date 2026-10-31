@@ -137,26 +137,47 @@ def _run_wake_channel(meta: dict) -> dict | None:
 
 
 def _wake_channel(rows: list[dict]) -> str:
-    """Say whether anything is actually watching for a signal, in one line.
+    """Say whether anything is actually able to wake a person, in one line.
 
     A monitoring loop has two halves: the scheduled tick that detects and records, and the armed
     observer whose exit wakes a conversation. Only the second half can reach a person, and it dies
     with the process that armed it (a WebUI restart takes it down), so "the timer is enabled" says
     nothing about whether anyone will be woken. Reported from the field: the loop was down while the
     schedule looked healthy, and the only way to notice was `ps`.
+
+    Two states that look alive must not both read `armed` (#22). An observer restarted by doctor is a
+    child of the oneshot doctor unit: it watches the file and keeps the run supervised, but nothing
+    tracks its exit, so no wake can be delivered. That is `supervision only`, and it is a different
+    sentence from `armed -- nobody will be woken`. The heartbeat age travels with the verdict because
+    "armed" is a claim about a process, and the age is the only number that makes the claim checkable.
     """
-    armed = []
+    session_owned, supervision_only = [], []
     for row in rows:
         if row.get("status") != "running":
             continue
         channel = row.get("wake_channel")
         if not channel:
             continue
-        armed.append("%s watching %s" % (row["run"], channel.get("path") or "(unknown path)"))
-    if armed:
-        # Every armed observer, not just the first: several loops can be armed at once, and naming
-        # one of them would make the others invisible again.
-        return "armed -- " + "; ".join(sorted(armed))
+        age = row.get("sup_age_s")
+        where = "%s watching %s (heartbeat %s)" % (
+            row["run"], channel.get("path") or "(unknown path)",
+            "?" if age is None else "%ds" % age)
+        if row.get("phase_origin") == "doctor":
+            supervision_only.append(where)
+        else:
+            session_owned.append(where)
+    if session_owned:
+        line = "armed -- " + "; ".join(sorted(session_owned))
+        if supervision_only:
+            line += ("; supervision only, its exit wakes nobody -- "
+                     + "; ".join(sorted(supervision_only)))
+        return line
+    if supervision_only:
+        return ("not armed -- " + "; ".join(sorted(supervision_only))
+                + " was restarted by doctor: the file is watched and the run is supervised, but no "
+                  "session owns that process, so a wake would have nowhere to go. Recovery after a "
+                  "restart is supervision-only; re-arm from the session that should hear about it "
+                  "(`hk run --id <new-id> -- <command...>`)")
     return ("not armed -- no observer is running, so a scheduled tick can record but cannot wake a "
             "conversation; re-arm with `hk run --id <id> -- <command>`")
 
@@ -166,7 +187,7 @@ def cmd_status(args: argparse.Namespace, cfg: dict) -> int:
     targets = _targets(args)
     rows = []
     for rid in targets:
-        rows.append(_describe(rid))
+        rows.append(_describe(rid, cfg))
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
@@ -176,7 +197,7 @@ def cmd_status(args: argparse.Namespace, cfg: dict) -> int:
     wake_rows = rows
     if not getattr(args, "all", False):
         described = {row["run"]: row for row in rows}
-        wake_rows = [described.get(rid) or _describe(rid) for rid in _all_run_ids()]
+        wake_rows = [described.get(rid) or _describe(rid, cfg) for rid in _all_run_ids()]
     if not rows:
         print("(no runs)")
         print("wake channel: " + _wake_channel(wake_rows))
@@ -199,7 +220,7 @@ def cmd_status(args: argparse.Namespace, cfg: dict) -> int:
     return 0
 
 
-def _describe(rid: str) -> dict:
+def _describe(rid: str, cfg: dict) -> dict:
     rd = store.run_dir(rid)
     meta = store.read_json(rd / store.META, {}) or {}
     state = store.read_json(rd / store.STATE, {}) or {}
@@ -210,13 +231,17 @@ def _describe(rid: str) -> dict:
     sup_age = store.mtime_age(rd / store.SUP_BEAT)
     lease = store.read_json(rd / store.LEASE, {}) or {}
     seen = float(lease.get("agent_seen") or 0)
+    # The staleness window is the configured one: a hardcoded 180 disagreed with doctor (which uses
+    # `sup_stale_seconds`) and with any test that lowers it, so `status` called a 186-second-old
+    # heartbeat `running` on a host whose own threshold said 1 (#22).
+    stale = float(cfg["sup_stale_seconds"])
     if state.get("finished"):
         # finish_reason is the durable verdict; result.json only exists for the terminal reasons
         # the phase wrote itself, so a run stopped by hand falls back to state and reads
         # "stopped" instead of being displayed as a failure (#7).
         reason = str(result.get("reason") or state.get("finish_reason") or "")
         status = {"done": "done", "stopped": "stopped"}.get(reason, "gave-up")
-    elif sup_age is not None and sup_age < 180:
+    elif sup_age is not None and sup_age < stale:
         status = "running"
     else:
         status = "unwatched"
@@ -242,6 +267,9 @@ def _describe(rid: str) -> dict:
         # The channel is part of the run's identity, not a parsing trick over argv, and it is the only
         # thing the status footer needs.
         "wake_channel": _run_wake_channel(meta),
+        # "session" or "doctor": who started the supervisor that is running now. The footer needs it
+        # because only a session-owned observer can deliver a wake (#22).
+        "phase_origin": state.get("phase_origin") or "session",
     }
 
 

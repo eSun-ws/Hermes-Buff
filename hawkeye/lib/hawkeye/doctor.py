@@ -8,6 +8,7 @@ It is meant to run from a systemd user timer (``config/systemd/hawkeye-doctor.*`
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -69,7 +70,11 @@ def _restart(cfg: dict, rd: Path, meta: dict) -> tuple[Optional[int], str]:
     try:
         handle = open(log, "wb")
         try:
+            # The origin travels in the environment because the phase cannot otherwise tell a
+            # session-owned start from a doctor restart, and the difference decides whether its exit
+            # can wake anybody at all (#22).
             proc = subprocess.Popen([sys.executable, entry, "phase", "--run", rd.name],
+                                    env={**os.environ, "HAWKEYE_PHASE_ORIGIN": "doctor"},
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=handle, start_new_session=True)
         finally:

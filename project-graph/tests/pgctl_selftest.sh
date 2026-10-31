@@ -48,6 +48,44 @@ check "tool invoke: the script reaches its own status capture after \`timeout\`"
 check "tool invoke: the 124/137 handler is still in the tree" \
   "$(grep -q 'rc == 124' "$PGCTL" && echo 0 || echo 1)" "handler missing"
 
+# The handler proven end to end, not merely reachable: the call above fails in a millisecond, so it
+# says nothing about a call that actually hangs. The stand-in ignores SIGTERM and leaves a detached
+# copy of itself behind, because that is the part `timeout` cannot clean up on its own: it kills the
+# child it spawned, so a straggler assertion aimed at that child passes even when the handler never
+# runs (measured -- an earlier version of this arm was green on the pre-#23 code). Only
+# `kill_stragglers` can reach the detached copy, so that is what the third assertion watches.
+state="$WORK/state23e"
+mkdir -p "$state"
+cat >"$state/hang.sh" <<'FAKE'
+#!/bin/bash
+if [[ -z ${STRAY_CHILD:-} ]]; then
+  echo $$ >"${PIDFILE:?}"
+  # A detached copy with the same argv, so its command line still matches what kill_stragglers greps
+  # for. Bounded by `timeout 60`: a test that fails must not leave a spinner on the host.
+  STRAY_CHILD=1 timeout 60 setsid "$0" "$@" >/dev/null 2>&1 &
+  echo $! >"${CHILDFILE:?}"
+fi
+trap '' TERM          # a hung call that does not wind down on TERM
+while :; do sleep 0.2; done
+FAKE
+chmod +x "$state/hang.sh"
+started=$(date +%s)
+PG_TOOL_TIMEOUT=1 PG_NODE="$state/hang.sh" PIDFILE="$state/hang.pid" \
+  CHILDFILE="$state/stray.pid" PG_STATE="$state" \
+  "$PGCTL" tool invoke get_project >"$state/out.txt" 2>"$state/err.txt"
+rc23e=$?
+elapsed=$(( $(date +%s) - started ))
+stray_pid=$(cat "$state/stray.pid" 2>/dev/null || true)
+
+check "tool invoke: a hung call is killed after --kill-after (137, not the TERM status)" \
+  "$([[ $rc23e -eq 137 ]] && echo 0 || echo 1)" "rc=$rc23e after ${elapsed}s"
+check "tool invoke: the 124/137 handler body runs on a real hang" \
+  "$(grep -q 'timed out after 1s (stragglers cleared)' "$state/err.txt" && echo 0 || echo 1)" \
+  "stderr: $(tail -1 "$state/err.txt" 2>/dev/null)"
+check "tool invoke: the detached straggler the handler clears is gone" \
+  "$([[ -n $stray_pid ]] && ! kill -0 "$stray_pid" 2>/dev/null && echo 0 || echo 1)" \
+  "stray pid ${stray_pid:-<never spawned>} still alive"
+
 # ── #24: two saves inside one second both count ──────────────────────────────────────────────────
 # The stand-ins: `node` is never called by `save`; `xdotool` fakes the window and, on `ctrl+s`,
 # appends a byte to the project the way the app would on disk.

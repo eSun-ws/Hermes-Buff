@@ -463,6 +463,79 @@ def test_status_says_whether_the_wake_channel_is_armed() -> None:
     shutil.rmtree(rd2, ignore_errors=True)
 
 
+def test_status_separates_armed_from_supervision_only() -> None:
+    """`armed` must mean "its exit can wake a conversation", not "a heartbeat file moved" (#22).
+
+    Two ways the old line lied, both measured on the reporter's host:
+
+      * a phase started by doctor's `_restart` is a child of the oneshot doctor unit, with no
+        terminal session behind it -- it watches the file and keeps the run supervised, but nothing
+        tracks its exit, so no wake can be delivered;
+      * the staleness window was a hardcoded 180 while doctor used `sup_stale_seconds`, so on the
+        probe host (threshold 1) a 186 s-old heartbeat still classified the run `running` and the
+        footer read `armed` for a loop with no process behind it.
+    """
+    cli = Path(__file__).resolve().parents[1] / "bin" / "hk"
+    root = BASE / "wake-owned-root"
+    conf = cfg("wake-owned", sup_stale_seconds=5)   # a window that still fails a hardcoded 180
+    env = {**ENV, "HAWKEYE_V2_ROOT": str(root), "HAWKEYE_V2_CONFIG": str(conf)}
+
+    def status() -> str:
+        return subprocess.run([sys.executable, str(cli), "status"], capture_output=True, text=True,
+                              env=env, timeout=120).stdout
+
+    def probe_run(name: str, **state):
+        rd = root / name
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / "meta.json").write_text(json.dumps({
+            "kind": "exec",
+            "wake_channel": {"kind": "watch-file", "path": "/tmp/sig-%s.md" % name}}))
+        (rd / "state.json").write_text(json.dumps(state))
+        (rd / "sup.heartbeat").write_text("beat")
+        return rd
+
+    def footer(out: str) -> str:
+        return out.split("wake channel:")[-1]
+
+    rd = probe_run("owned-by-session", phase_origin="session")
+    out = status()
+    check("status: a session-owned observer is armed, with the heartbeat age it believes",
+          "wake channel: armed" in out and "owned-by-session" in footer(out)
+          and "heartbeat 0s" in footer(out), footer(out)[:200])
+    shutil.rmtree(rd, ignore_errors=True)
+
+    rd = probe_run("owned-by-doctor", phase_origin="doctor")
+    out = status()
+    check("status: a doctor-restarted observer is not reported as armed",
+          "wake channel: not armed" in out and "owned-by-doctor" in footer(out)
+          and "supervision-only" in footer(out), footer(out)[:260])
+    check("status: the supervision-only state names the re-arm it needs",
+          "hk run --id" in footer(out), footer(out)[:260])
+    shutil.rmtree(rd, ignore_errors=True)
+
+    # Both kinds at once: the live one keeps the line `armed`, and the silent one is still named --
+    # a footer that mentions only the healthy observer would hide exactly the one that needs action.
+    rd_a = probe_run("owned-by-session-2", phase_origin="session")
+    rd_b = probe_run("owned-by-doctor-2", phase_origin="doctor")
+    out = status()
+    check("status: a mixed host names both observers",
+          footer(out).strip().startswith("armed") and "supervision only" in footer(out)
+          and "owned-by-session-2" in footer(out) and "owned-by-doctor-2" in footer(out),
+          footer(out)[:260])
+    shutil.rmtree(rd_a, ignore_errors=True)
+    shutil.rmtree(rd_b, ignore_errors=True)
+
+    # A dead observer is not armed, however it was started: the window comes from the config.
+    rd = probe_run("stale-heartbeat", phase_origin="session")
+    old = time.time() - 30
+    os.utime(rd / "sup.heartbeat", (old, old))
+    out = status()
+    check("status: the configured sup_stale_seconds decides, not a hardcoded 180",
+          "wake channel: not armed" in out and "stale-heartbeat" not in footer(out),
+          footer(out)[:240])
+    shutil.rmtree(rd, ignore_errors=True)
+
+
 def test_wake_policy_coalesces_and_never_drops_a_round() -> None:
     """A detection is not a decision: the policy, not the detector, decides who gets woken.
 
@@ -809,7 +882,48 @@ def test_phase_death_recovery() -> None:
     check("recover: restarted phase picks up and finishes", done and result.get("reason") == "done", str(result))
 
 
-# ── 5. milestone reports + no wake spam without a lease + work not held back ─
+def test_recovery_is_supervision_only() -> None:
+    """A doctor restart revives supervision, not the wake channel (#22).
+
+    The reporter bounded what a fix may promise: the wake rides the terminal session that created the
+    run, and `_restart` spawns a child of the oneshot doctor unit, which has no such record. So after
+    a hard kill the honest states are *supervised and silent* or *dead* -- `armed` is neither.
+
+    Driven end to end on purpose. The fixture-written state in
+    `test_status_separates_armed_from_supervision_only` proves the reader; this proves the writer:
+    doctor spawns the phase, the phase records how it was started, and the footer believes it.
+    """
+    conf = cfg("recover-owned", sup_stale_seconds=0.6, poll_seconds=0.2, report_interval_seconds=0)
+    signal_file = BASE / "recover-owned.signal"
+    signal_file.write_text("seed\n")
+    rid = "recover-owned-1"
+    env = {**ENV, "HAWKEYE_V2_CONFIG": str(conf)}
+    phase = subprocess.Popen([sys.executable, str(HK), "run", "--id", rid, "--",
+                              sys.executable, str(HK), "watch-file",
+                              "--path", str(signal_file), "--interval", "0.2", "--ttl", "120"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    check("recover-owned: a session-started watcher is beating",
+          wait_for(lambda: (RUNS / rid / "sup.heartbeat").is_file(), 15))
+    out = hk(["status"], conf).stdout
+    check("recover-owned: it starts out armed and session-owned",
+          "wake channel: armed" in out and rid in out.split("wake channel:")[-1]
+          and "heartbeat" in out.split("wake channel:")[-1], out[-200:])
+
+    phase.send_signal(signal.SIGKILL)          # the WebUI that armed it goes away
+    phase.wait(timeout=5)
+    time.sleep(1.0)                            # past sup_stale_seconds: the run is orphaned now
+    hk(["doctor", "--fix"], conf, check=False)
+    state = read(rid, "state.json") or {}
+    check("recover-owned: the restarted phase knows doctor started it",
+          state.get("phase_origin") == "doctor", "phase_origin=%r" % state.get("phase_origin"))
+    out = hk(["status"], conf).stdout
+    footer = out.split("wake channel:")[-1]
+    check("recover-owned: the footer refuses to call a doctor restart armed",
+          "not armed" in footer and "supervision-only" in footer and rid in footer, footer[:300])
+    hk(["stop", "--run", rid], conf, check=False)
+
+
+# ── 5. milestone reports + no wake spam without a lease + work not held back ─────────────────────
 def test_milestone_and_wake_discipline() -> None:
     conf = cfg("ms", attempts=1, milestone_flush_seconds=0.3)
     job = script("ms.sh", "#!/bin/bash\n"
@@ -2941,6 +3055,8 @@ def main() -> int:
                  test_install_survives_a_symlinked_skill_document,
                  test_doctor_notices_a_restart_that_dies_with_its_own_unit,
                  test_status_says_whether_the_wake_channel_is_armed,
+                 test_status_separates_armed_from_supervision_only,
+                 test_recovery_is_supervision_only,
                  test_wake_policy_coalesces_and_never_drops_a_round,
                  test_issue_tick_records_every_round_and_signals_only_on_a_verdict,
                  test_ledger_round_allocator_is_shipped_and_serialised,

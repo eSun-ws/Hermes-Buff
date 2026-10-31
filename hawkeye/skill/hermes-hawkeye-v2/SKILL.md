@@ -598,6 +598,13 @@ existing one. Five rules that cost the loop silently:
   separately, what it does **not** fix; ranked fixes each with an acceptance criterion that can be re-run; and an appendix
   naming the data sources so the owner can falsify the numbers. A chat paraphrase loses the counts and cannot be turned
   into an acceptance test. Write it under the workspace docs, keep the chat reply to the path plus three findings.
+- **An assertion aimed at the layer that would have died anyway is green on the broken code.** The
+  `tool invoke` straggler arm watched the direct child of `timeout`, and `timeout --kill-after` kills
+  that child whether or not the handler runs: the arm passed on the pre-fix build and proved nothing.
+  Point the assertion at the process only the fixed code can reach (a detached copy the stand-in
+  leaves behind), and check the handler's own log line as a separate fact — a branch that ran prints
+  something; a branch that was skipped cannot. Prove the arm red against the old code before trusting
+  it green, in this family too.
 - **A test can pass because the code it drives never ran**, a redirected install can rewrite the
   host's units, and a load harness can "prove" a race fixed without ever entering the window. All
   three live in `references/testing-and-release.md` (child-process liveness assertion, revert-callers
@@ -705,9 +712,16 @@ Rules:
 - **Say who spoke.** A round can mix our reply with theirs; naming the first commenter printed
   "by <us>" for exactly the rounds that mattered and made the wake look like an echo. The reason
   names the other party and counts our own as `+N own`.
-- **Report whether the channel is armed, in `hk status`.** The observer is a child of whatever armed
-  it, so a WebUI restart silently kills the loop while the timer still looks healthy. `hk status`
-  prints `wake channel: armed -- <run> watching <path>` or `not armed`, and `hawkeye-doctor.timer`
-  is the backstop that re-arms it.
+- **Report whether the channel is armed, in `hk status`, and mean the word.** The observer is a child
+  of whatever armed it, so a WebUI restart silently kills the loop while the timer still looks
+  healthy. `hk status` prints `wake channel: armed -- <run> watching <path> (heartbeat 3s)`, or
+  `not armed` with the reason. **A doctor restart restores supervision, not the wake channel**: the
+  wake rides the terminal session that created the run, and `_restart` spawns a child of the oneshot
+  doctor unit, which no session owns, so its exit wakes nobody. That state reads
+  `not armed -- ... was restarted by doctor: ... recovery after a restart is supervision-only`, and
+  the only cure is re-arming from the session that should hear about it -- a new run id, because a run
+  id is terminal. The heartbeat age travels with the verdict (`sup_stale_seconds` from the config
+  decides, not a constant baked into `status`): "armed" is a claim about a live process, and the age
+  is the number that makes it checkable.
 - **Do not arm a loop whose only output is "still working".** If a round would produce a progress
   note, it does not deserve a turn. Batch it, or leave it in the ledger for the next real wake.
