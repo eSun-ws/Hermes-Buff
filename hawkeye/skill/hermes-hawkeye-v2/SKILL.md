@@ -80,6 +80,37 @@ Python >= 3.11), this **skill** (the agent-side procedure), and an optional
   report the outcome back into the originating session.
 - You need "the work keeps running even if I am gone, and no report is lost".
 
+## Hermes owns the channel, hawkeye owns the policy
+
+Do not describe hawkeye as an alternative wake mechanism. The wake still travels Hermes' own path: a
+phase exits, `notify_on_complete` enqueues onto `process_registry.completion_queue`, the WebUI drain
+thread resolves the origin session and starts the turn server-side. Everything hawkeye adds sits above
+that line, and if that line is down hawkeye is silent no matter how correct its policy is.
+
+| Layer | Hermes built-in | hawkeye |
+|---|---|---|
+| Answers | "something finished — send it back to the session that started it" | "is the work still alive, did it fail, does this deserve a turn" |
+| Work survival | the process is a child of the tool; a tool timeout, `/new` or compaction can take it (`persist_on_release` mitigates) | detached phase + supervisor in its own process group; `hk stop` kills both groups and re-checks |
+| Failure | none — a crash is one notification, no retry, no recorded state | attempts, `max_restarts`, stall detection, `attempts_exhausted`, `incident.json` |
+| Acknowledgement | none — delivery is never confirmed | `hk lease`; an unacknowledged report becomes `agent_unreachable` after `wake_grace_seconds` |
+| Frequency | one wake per exit, uncapped | `wake-policy.py`: a new item wakes, everything else coalesces on cooldown; corrupt state refuses instead of resetting |
+| Audit | the single message in the chat | `runs/<id>/{state.json,events,report.md}`, the numbered ledger, `hk status --all`, `hk gc` |
+| Timing | `heartbeat` is not a wake channel on the WebUI (below); timing means a job that *exits* at the deadline | cron `no_agent` detects (0 tokens, no session) + a watcher exit wakes |
+
+**`heartbeat=N` never wakes a WebUI session.** `api/background_process.py`'s `format_wakeup_prompt()`
+returns `None` for any `evt_type` outside `completion` / `watch_match` / `watch_disabled` /
+`async_delegation`, so a heartbeat event yields no prompt and no turn — it only reaches an open tab as
+an SSE frame. Heartbeats *do* wake the CLI/TUI, where `tools/process_registry_notifications.py` renders
+them as `[Background process … heartbeat #N — still running]`; do not assume the two surfaces behave
+the same. On the WebUI, "check every N minutes" must be a job that exits at the deadline (`sleep N &&
+echo "HK-MS …"`) or an `until <condition>; do sleep 30; done` watcher — exit is the only wake channel
+there.
+
+Two costs hawkeye carries for keeping its policy: the observer is a child of whatever armed it (a WebUI
+restart takes it down, and a doctor restart restores supervision, not the wake channel), and the channel
+itself belongs to Hermes, so `hk status`'s `wake channel:` line is the only place the two layers are
+reconciled.
+
 ## Three hard constraints (do not invent your own wake channel)
 
 | Fact | Consequence |
@@ -487,6 +518,11 @@ existing one. Five rules that cost the loop silently:
   job's monitor was swapped** (delivery tests do exactly that). Fix the job, not
   the issue: the Cron section of the `hermes-agent` skill's background-systems
   reference carries the swap/restore procedure.
+- **A batch of open issues is triage first, code second.** Ask what each thread already fixed before
+  writing anything: most of a list can be fixed-and-unclosed, and a half-fixed issue is the normal
+  shape — the crash fixed, the verdict it printed left lying. Classify each item against HEAD with a
+  probe, answer any pending offer in the same pass, then close with the commit range and the arm that
+  now carries the invariant. Procedure and close-verification: `references/testing-and-release.md` §9.
 - **Cadence belongs to the schedule, and whoever runs the loop owns it.** Every wake is a full turn, so
   an interval tuned for a burst (a reporter replying every few minutes) is pure waste once the thread
   goes quiet: after two consecutive rounds that found nothing to fix, lengthen the detection interval,
